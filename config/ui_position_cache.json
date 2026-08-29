@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "copy_link": {
+    "center_x_1000": 456,
+    "center_y_1000": 143,
+    "dpi": 192,
+    "window_width": 1100,
+    "window_height": 1324,
+    "source": "cache-validated",
+    "updated_at": "2026-08-29T02:09:14+08:00"
+  },
+  "menu_button": {
+    "center_x_1000": 778,
+    "center_y_1000": 31,
+    "dpi": 192,
+    "window_width": 1100,
+    "window_height": 1324,
+    "source": "cached-menu-button-opencv",
+    "updated_at": "2026-08-29T02:09:14+08:00"
+  }
+}

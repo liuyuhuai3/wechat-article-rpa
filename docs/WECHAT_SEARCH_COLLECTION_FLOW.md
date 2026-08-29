@@ -1,0 +1,389 @@
+# 微信搜一搜公众号文章采集流程
+
+## 1. 文档用途
+
+本文记录当前项目在 Windows 11 微信桌面客户端中，通过“搜一搜”窗口采集指定公众号文章的实际流程、页面识别方式、校验边界、去重规则、失败恢复和冒烟测试方法。
+
+这是实现维护文档，不是目标架构设计。后续增加、删除或修改采集步骤时，必须同步更新本文对应章节，并补充或调整离线回归测试。
+
+当前适用入口：
+
+```powershell
+.venv\Scripts\python.exe wechat_visual_rpa.py --run-search-accounts --live --account-name "厦门日报" --max-articles 1 --scan-range today --metrics share --output-dir ".\output\smoke-test-win11"
+```
+
+## 2. 当前运行边界
+
+- 采集器运行在 Windows 11 虚拟机的交互式桌面中。
+- 微信必须已登录，并已打开或能够打开“搜一搜”。
+- 采集器独占鼠标、键盘和微信窗口；运行期间不要人工操作。
+- 当前 Win11 微信页面主要使用内置 Chromium，搜一搜和公众号资料页可能共用同一个 `Chrome_WidgetWin_0` 窗口，并通过标签页切换页面。
+- 当前固定适配的 Win11 微信主界面为“左侧竖向功能栏 + 左侧会话列表 + 右侧聊天区”布局；主界面全局搜索框位于左侧会话栏顶部，约占窗口归一化坐标 `x=18.5%、y=8.0%`。从主界面恢复搜一搜时使用专用 OCR/布局定位，不再使用旧版主界面坐标。
+- 页面识别以截图、本地 OCR、模板匹配和必要的内网 Qwen-VL 复核为主，不依赖浏览器 DOM。
+- `--max-articles 1` 表示每个公众号最多成功采集一篇文章，不表示只扫描一张资料页截图。
+
+## 3. 最小闭环
+
+```mermaid
+flowchart TD
+    A[微信已登录且搜一搜可用] --> B[确认/激活搜一搜窗口]
+    B --> C[输入公众号搜索名并提交]
+    C --> D{确认搜索结果页}
+    D -- 否 --> C1[等待并重复截图 OCR]
+    C1 --> D
+    D -- 是 --> E[识别“全部”页公众号卡片]
+    E --> F{公众号名称与账号匹配}
+    F -- 否 --> X[本次账号失败并保存证据]
+    F -- 是 --> G[点击公众号名称/头像]
+    G --> H[按页面内容确认资料页]
+    H --> I[识别今天/昨天文章卡片]
+    I --> J[点击候选文章]
+    J --> K[复制文章 URL]
+    K --> L[解析文章标题、账号、正文、发布时间]
+    L --> M{URL/账号/正文/时间校验}
+    M -- 否 --> N[关闭文章标签并按策略重试]
+    N --> J
+    M -- 是 --> O[标题 OCR 只作告警，详情页标题为准]
+    O --> P[识别互动指标并复核文章 URL]
+    P --> Q[本地导出/可选 MongoDB 入库]
+    Q --> R[关闭文章标签，返回资料页]
+    R --> S[达到上限或继续扫描]
+```
+
+最小闭环的成功标准是：日志出现 `article_collect_succeeded`，并且对应文章目录中存在 `collection.json`、`verification.json` 和文章证据截图。仅看到公众号资料页或复制到 URL，不算文章采集成功。
+
+## 4. 分阶段实际流程
+
+### 4.1 启动与窗口准备
+
+入口位于 `wechat_visual_rpa.py` 的账号采集流程。启动后会：
+
+1. 读取命令行、账号文件或 MongoDB 中的账号。
+2. 记录 `run_started`，包括参数、输出目录和源码指纹 `source_fingerprint`。
+3. 检查微信窗口、进程名、屏幕尺寸和可见性。
+4. 将搜一搜窗口排列到可识别区域。
+5. 保留已有资料页和未知标签，不在搜索初始化阶段把资料页误当作旧标签关闭。
+
+同一批次的后续账号会复用已经确认的搜一搜窗口：上一账号完成资料页清理后，下一账号先确认首标签仍有搜一搜搜索框，满足条件时跳过重复的标签校准。首次启动、首标签不确定或恢复流程仍执行完整确认，并记录 `search_window_hot_reused` 或恢复事件。
+
+公众号资料页关闭后，首标签可能回到“搜一搜首页”，而不是保留上一次的结果页。首页现在作为合法的搜一搜工作面识别，先确认搜索框和首页分类导航，再输入下一账号；搜索按钮 OCR 失败时使用绿色按钮视觉区域兜底，不会因此误判为需要重建窗口。
+
+如果搜一搜窗口丢失，恢复顺序是：激活/检查现有微信窗口 → 使用 Win11 主界面左上角全局搜索框输入“搜一搜” → 回车打开内置搜一搜 → 等待并验证新的搜一搜窗口。恢复坐标和识别方法会记录在 `wechat_main_search_box_fallback` 或 `sogou_recovery_succeeded` 事件中。
+
+Win11 中不能只用窗口标题或 HWND 判断页面。搜一搜、资料页和文章页都可能显示标题“微信”，因此页面角色必须通过截图内容和标签探测确认。
+
+### 4.2 搜索公众号
+
+当前 Win11 优先走新版“全部”页路径：
+
+1. 识别并激活搜一搜搜索框。
+2. 输入公众号搜索名并点击搜索。
+3. 如果输入后出现联想下拉框，先按 `Esc` 关闭，再用搜索按钮或回车提交。
+4. 保存每次提交后的证据图 `search-after-submit-*.png`。
+5. 循环等待结果页加载，不再固定只等待两秒。
+6. 自动提交最多尝试三轮；前两轮不调用 Qwen-VL，避免把联想下拉框截图送入模型。
+7. 优先在“全部”页的“关键词 - 账号”区域识别公众号卡片。
+8. 如果新版直接卡片路径未命中，再识别顶部“账号”分类。
+9. 旧版页面若存在二级筛选，再识别“公众号”筛选项。
+10. 对公众号名称、媒体/官方后缀和公众号内容证据进行安全校验。
+11. 只有出现 `search_result_page_confirmed`，才认为真正进入结果页。
+
+自动提交三轮仍失败时，默认保留现场并让当前账号失败；值守测试时可增加
+`--manual-search-fallback`，程序会等待最多 120 秒，由人工在当前搜一搜窗口完成搜索，
+检测到目标结果页后继续执行后续公众号和文章采集。该选项不适合无人值守批量任务。
+
+名称校验允许搜索结果出现“媒体”等展示后缀，但文章归属始终使用账号配置中的标准名称。例如：
+
+```text
+配置账号：厦门日报
+搜索结果：厦门日报 媒体
+文章页账号：厦门日报
+```
+
+### 4.3 打开并确认公众号资料页
+
+公众号卡片通过名称区域或头像点击。点击后会：
+
+1. 记录 `profile_name_clicked` 或头像回退点击事件。
+2. 枚举微信窗口和 Chromium 标签。
+3. 在独立资料窗口或搜一搜内嵌资料标签中寻找目标页面。
+4. 使用资料页顶部账号名称 OCR 确认页面身份。
+5. 记录 `profile_opened_and_verified`。
+6. 为资料页保存基线截图 `profile-opened.png`。
+
+资料页确认的强条件是页面内容中的账号名称匹配，而不是窗口标题。若资料页是搜一搜浏览器内嵌标签，目标对象标记为 `embedded_profile_tab`，后续必须先激活该标签再截图、滚动或点击。
+
+点击公众号卡片后，如果当前活动标签的 OCR 没有立即确认资料页，程序会先扫描同一 Chromium 窗口的其他标签，并用资料页顶部账号名称逐个确认。只有所有标签都无法确认时，才进入头像重试或搜索页恢复；扫描过程记录为 `profile_tab_probe`，成功恢复记录为 `profile_tab_recovered`。`found=false` 只代表当前截图未通过该阶段的页面证据，不等同于关闭或不存在资料页。
+
+如果资料页确认失败，不应直接关闭搜一搜窗口。应先保存窗口清单、探测截图和失败原因，再按账号搜索重试策略处理。每次失败还会记录 `profile_detection_attempt`，其中包含 OCR 读到的顶部候选和资料页结构证据（如“关注”“全部”“文章”“视频号”），用于区分“页面不存在”和“OCR/活动标签误判”。
+
+### 4.4 识别资料页文章卡片
+
+`analyze_profile_window()` 先使用本地 OCR，识别：
+
+- “今天”“昨天”等时间分组；
+- 文章标题和标题区域坐标；
+- 可选的阅读数、点赞数；
+- 推广、置顶或非文章卡片特征。
+
+资料页头部名称、纯数字、封面内文字和互动数字不是文章标题。缺少“阅读/赞”锚点时，仍允许本地 OCR 输出文章候选并先点击文章；互动锚点只用于补充列表指标，不是打开文章的前置条件。
+
+当本地 OCR 结果没有足够的时间分组或文章候选时，且允许 VL，才请求 Qwen-VL 复核资料页。Qwen-VL 的坐标仍需经过页面区域、账号身份和文章页面结果校验，不能直接盲点。
+
+时间规则：
+
+- `today`：资料页先筛选“今天”，文章页再按真实发布时间复核；
+- `yesterday`：资料页先筛选“昨天”，文章页再次复核；
+- `today_yesterday`：允许两类时间分组；
+- 遇到明确的星期、年月日或更早日期边界时停止继续翻页；
+- 没有本屏日期证据的卡片标记为 `ungrouped`，不猜测其归属日期。
+
+### 4.5 打开文章与提取正文
+
+每个候选文章卡片按以下顺序处理：
+
+1. 激活资料页目标标签。
+2. 点击文章卡片标题区域。
+3. 等待文章页面加载。
+4. 通过“复制链接”取得公众号文章 URL。
+5. 规范化 URL，并检查本轮是否已处理过。
+6. 请求文章页面，解析真实标题、公众号、发布时间和正文。
+7. 校验账号、正文非空、发布时间范围。
+8. 保存文章证据截图并识别底部互动指标。
+9. 再次复制文章 URL，确认采集互动指标期间页面没有切换。
+10. 将文章写入本地导出文件；启用 MongoDB 时执行幂等入库。
+11. 记录 `article_collect_succeeded`，关闭文章标签并返回资料页。
+
+文章详情页是最终数据来源：
+
+- `page.title` 是最终文章标题；
+- `page.account_name` 是最终公众号名称；
+- `page.content` 是最终正文；
+- `page.publish_time` 是扫描范围的最终判断依据；
+- 复制链接得到的规范化 URL 是文章唯一身份。
+
+### 4.6 等待策略与热窗口
+
+等待不再以固定睡眠时间作为成功条件，主要状态闸门如下：
+
+- 窗口激活：轮询前台句柄，确认窗口置前后只保留短暂渲染缓冲；
+- 窗口移动：轮询实际窗口矩形，达到目标位置后立即继续；
+- 搜索提交：提交后立即进行第一次结果截图，未加载完成时按递增间隔重试；
+- 文章点击：比较点击前后的标签栏/页面截图，检测到明显导航变化后立即进入 URL 复制；超时仍走原有复制链接校验；
+- 资料页滚动：保留懒加载缓冲，由下一次 OCR 结果决定是否继续，不依赖固定等待作为页面成功依据。
+
+这些优化只减少无效等待，不放宽页面身份校验。文章标签仍必须逐篇关闭并确认回到资料页；搜一搜主窗口不作为文章清理对象。
+
+## 5. 标题校验策略
+
+资料页卡片标题来自 OCR，可能出现：
+
+- 卡片显示省略号；
+- 多行标题只识别到最后一行；
+- 标题开头或末尾被封面、互动指标遮挡；
+- 单个汉字或 AI/Al 等字符误识别。
+
+因此当前策略是：
+
+1. 继续计算 `titles_match()` 和 `title_similarity_score()`。
+2. 匹配成功或失败都记录到 `verification.json` 和运行日志。
+3. 标题不匹配只记录 `article_card_title_mismatch_warning`，不再阻断已经通过 URL、账号、正文和发布时间校验的文章。
+4. 文章详情页标题覆盖卡片 OCR 标题，卡片标题只保留为 `expected_card_title` 诊断信息。
+
+标题不能承担去重职责。否则会出现“详情页已经正确打开，但因卡片 OCR 不完整而漏抓”的情况。
+
+## 6. 去重与漏抓保护
+
+### 6.1 唯一身份
+
+文章唯一身份按以下优先级处理：
+
+```text
+规范化文章 URL > 文章页真实标题 > 资料页卡片 OCR 标题
+```
+
+URL 规范化会统一协议、域名大小写、查询参数顺序并移除片段。文章详情页成功解析后，批次内 URL 集合用于后续重复卡片判断；MongoDB 使用 `article.urlNormalized` 查询和幂等写入。
+
+### 6.2 卡片指纹的限制
+
+日期分组、卡片标题和阅读/点赞数据仍会作为审计指纹，但不在点击前跳过候选。原因是：
+
+- 同一文章在相邻滚屏中可能因 OCR 截断不同而产生不同指纹；
+- 不同文章可能拥有相同标题；
+- 不同文章的标题和互动数字也可能暂时相同；
+- 只有点击后才能得到可靠 URL。
+
+因此重复卡片允许被点击一次，取得 URL 后再跳过。这样会增加少量重复点击，但优先保证不同 URL 的文章不被错误合并或漏掉。
+
+### 6.3 三类结果
+
+| 结果 | 处理方式 |
+|---|---|
+| 新 URL，详情页校验成功 | 采集、导出或入库，登记本轮 URL |
+| 已出现的 URL | 记录 `article_skipped_duplicate_url`，不重复写文章 |
+| 详情页 URL、账号、正文或时间校验失败 | 关闭文章标签，按文章重试次数处理；最终写入失败队列 |
+
+`--max-articles` 只统计成功采集的文章；重复 URL 和超出扫描范围的文章不会占用成功文章名额。
+
+## 7. 重试、清理和失败证据
+
+### 7.1 重试层级
+
+- 搜索公众号：最多三次账号搜索尝试；
+- 资料页 OCR：本地 OCR 多次尝试，必要时 Qwen-VL 兜底；
+- 文章打开与解析：同一卡片最多三次文章尝试；
+- 文章标签清理失败：停止当前公众号，避免旧标签造成文章错配；
+- 账号级失败：保存 `summary.json` 或部分检查点，继续后续账号或由控制台重试。
+
+批量账号之间不启动并发鼠标任务。热窗口只是复用同一个已确认的搜一搜会话；任何页面身份不确定时，必须退出热路径，执行完整标签探测或安全恢复。
+
+### 7.2 清理原则
+
+文章处理无论成功、跳过还是异常，都会进入标签清理流程。清理时必须保留资料页目标标签。不能用“关闭最后一个窗口”代替“关闭当前文章标签”，否则可能误关搜一搜或公众号资料页。
+
+### 7.3 应保留的诊断文件
+
+发生失败时，优先保留：
+
+- `run.log`；
+- `search-after-submit.png`、`search-after-submit-*.png`、`search-result.png`；
+- `profile-opened.png`、`profile-window-local-*.png`；
+- `feed.json`；
+- `article_evidence.png`、`article_footer.png`；
+- `verification.json`、`collection.json`；
+- `attempt-*-error.txt`；
+- `summary.json`、`partial-summary.json`。
+
+不要复用历史输出目录。每次冒烟测试使用新的 `--output-dir`，避免旧截图和 JSON 混入本次结果。
+
+## 8. 运行日志关键事件
+
+| 事件 | 含义 |
+|---|---|
+| `run_started` | 本次任务启动，含参数和源码指纹 |
+| `search_box_detection` | 搜一搜搜索框识别结果 |
+| `search_submitted` | 已提交公众号搜索 |
+| `search_submit_attempt_failed` | 本轮提交后仍未确认结果页 |
+| `search_result_page_confirmed` | 已确认进入真实结果页 |
+| `account_card_directly_selected` | Win11“全部”页直接选中公众号卡片 |
+| `search_manual_fallback_requested` / `search_manual_fallback_succeeded` | 请求人工搜索 / 已检测到人工完成的结果页 |
+| `account_card_directly_selected` | Win11“全部”页直接选中公众号卡片 |
+| `profile_opened_and_verified` | 已打开并验证资料页 |
+| `profile_feed_local_succeeded` | 本地 OCR 识别出资料页文章候选 |
+| `vl_fallback_requested` | 本地识别不足，触发 Qwen-VL |
+| `article_url_copied_before` | 打开文章后首次复制 URL |
+| `article_page_parsed` | 已解析文章详情页 |
+| `article_card_title_mismatch_warning` | 卡片 OCR 标题与详情页标题不一致，仅告警 |
+| `article_skipped_duplicate_url` | 规范化 URL 已在本轮出现，跳过重复处理 |
+| `article_collect_succeeded` | 一篇文章完整采集成功 |
+| `article_tab_cleanup_failed` | 文章标签清理失败，通常应停止当前账号 |
+| `watch_cycle_started` / `watch_cycle_finished` | 增量监听一轮开始 / 完成 |
+| `incremental_known_url_stop` | 遇到已知 URL，按最新到最旧规则结束本轮 |
+| `watch_cycle_failed` / `watch_sleeping` | 监听轮次失败 / 等待下一轮 |
+
+## 9. 冒烟测试验收
+
+使用一个公众号、最多一篇文章：
+
+```powershell
+.venv\Scripts\python.exe wechat_visual_rpa.py --run-search-accounts --live --account-name "厦门日报" --max-articles 1 --scan-range today --metrics share --output-dir ".\output\smoke-test-win11-YYYYMMDD-HHMM"
+```
+
+验收顺序：
+
+1. `run_started` 的 `source_fingerprint` 已产生；
+2. 出现 `search_result_page_confirmed`；
+3. 出现 `profile_opened_and_verified`；
+4. 出现 `profile_feed_local_succeeded` 或合理的 `vl_fallback` 成功事件；
+5. 出现 `article_url_copied_before` 和 `article_page_parsed`；
+6. 文章详情页账号、正文和发布时间通过校验；
+7. 标题不匹配时只出现 warning，不应因此重复打开同一 URL；
+8. 出现 `article_collect_succeeded`，`summary.json` 中 `collected` 数量为 1；
+9. 文章标签关闭后搜一搜/资料页仍可用。
+
+批量性能测试时，第二个及后续账号应在日志中看到 `search_window_hot_reused`。若出现页面恢复、资料页标签探测失败或窗口尺寸变化，热路径会自动失效，不能以牺牲页面安全为代价强行复用。
+
+## 10. 增量监听模式
+
+第一优先级已实现单账号常驻增量监听。它复用同一套 Win11 搜一搜→公众号资料页→文章详情页闭环，但每轮只检查当天最新的有限数量卡片，避免每次从历史文章重新翻页。
+
+### 10.1 启动命令
+
+```powershell
+.venv\Scripts\python.exe wechat_visual_rpa.py --watch-account "厦门日报" --live --poll-interval 300 --recent-card-limit 3 --metrics share --write-mongo --output-dir ".\output\watch-xiamen"
+```
+
+- `--watch-account` 只接受一个公众号；监听模式自动使用 `today`，不使用 `--scan-range` 的其他值。
+- `--poll-interval` 是两轮之间的间隔，最小 30 秒，默认 300 秒。
+- `--recent-card-limit` 是每轮最多检查的当天文章卡片数，默认 3；它不是成功文章数。
+- `--watch-cycles 1` 或 `--watch-cycles 2` 用于有限轮数测试；默认 `0` 表示持续运行，按 `Ctrl-C` 停止。
+- 建议生产运行传入 `--write-mongo`。不传时仍会本地导出，但跨重启去重主要依赖状态文件。
+
+若需要每天 07:30 到 24:00 采集，增加时间窗口参数：
+
+```powershell
+.venv\Scripts\python.exe wechat_visual_rpa.py --watch-account "厦门日报" --live --watch-start-time 07:30 --watch-end-time 24:00 --poll-interval 600 --recent-card-limit 10 --metrics share --write-mongo --output-dir ".\output\watch-xiamen-day"
+```
+
+时间按北京时间解释。达到 24:00 后不再开启新一轮；如果当前文章仍在采集，会先完成当前轮次、关闭文章标签并保存 `watch-state.json`，随后进程留在等待状态，次日 07:30 自动恢复。程序不会在午夜强制关闭微信或被任务计划程序杀掉。
+
+### 10.2 单轮流程
+
+```mermaid
+flowchart TD
+    A[读取 watch-state.json] --> B[确认搜一搜并打开公众号资料页]
+    B --> C[只识别当天最新 N 张卡片]
+    C --> D{文章 URL 是否已知}
+    D -- 否 --> E[打开文章并采集正文/时间/互动]
+    D -- 是 --> F[停止本轮继续翻历史]
+    E --> G[更新 URL 状态并写入结果]
+    G --> H{达到本轮卡片上限}
+    H -- 否 --> C
+    H -- 是 --> I[保存状态并等待下一轮]
+    F --> I
+    I --> B
+```
+
+资料页必须按最新到最旧的顺序展示文章。监听器遇到第一篇已知 URL 时，假设后续卡片都是历史文章并停止本轮；如果未来微信改变排序，应关闭该停止规则后再上线。
+
+### 10.3 状态、去重与输出
+
+监听目录中的 `watch-state.json` 保存：账号名、已知规范化文章 URL、轮数、最近一轮时间、最近错误、最近轮摘要和时间窗口状态。每轮结果保存到独立目录：
+
+```text
+output/watch-xiamen/
+├── watch-state.json
+├── articles.jsonl
+├── articles.csv
+└── cycles/
+    ├── cycle-00001/summary.json
+    └── cycle-00002/summary.json
+```
+
+启动时若启用 `--write-mongo`，监听器还会从 `weixin.article` 按账号读取已有 URL，补充本地状态。文章详情页得到的规范化 URL 是唯一去重依据；标题 OCR 不参与跨轮次去重。
+
+关键监听日志包括：`watch_started`、`watch_window_opened`、`watch_outside_schedule`、`watch_cycle_started`、`watch_cycle_finished`、`watch_window_closed`、`watch_sleeping`、`watch_cycle_failed`、`watch_stopped` 和 `incremental_known_url_stop`。
+
+### 10.4 有限测试
+
+先用两轮验证状态和重复停止逻辑：
+
+```powershell
+.venv\Scripts\python.exe wechat_visual_rpa.py --watch-account "厦门日报" --live --watch-cycles 2 --poll-interval 30 --recent-card-limit 3 --metrics share --output-dir ".\output\watch-smoke-win11"
+```
+
+检查 `watch-state.json` 的 `cycle_count` 是否为 2，以及第二轮 `summary` 是否出现 `known_url_stop` 或按卡片上限结束。该模式目前是单账号监听能力；123 个账号仍需要后续调度器按账号串行分配，不能在同一个微信桌面上并发操作。
+
+## 11. 维护规则
+
+以后修改以下任一内容时，必须同步维护本文：
+
+- 微信页面路径、标签结构或窗口识别规则；
+- OCR 区域、字段或 Qwen-VL 触发条件；
+- 点击顺序、资料页/文章页确认条件；
+- 文章 URL、标题、账号、正文或发布时间校验；
+- 重试、标签清理和失败分类；
+- URL 去重、卡片指纹或 MongoDB 幂等策略；
+- 输出目录、证据文件或日志事件名称。
+
+同步工作至少包括：更新本文对应章节、更新 README 中的运行说明（若命令或前置条件改变）、新增或调整离线测试，并在固定 Win11 微信版本上重新执行单账号最小闭环。
