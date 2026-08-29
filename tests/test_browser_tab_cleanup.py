@@ -75,7 +75,12 @@ class BrowserTabCleanupTests(unittest.TestCase):
             "遍历现有标签后未找到真正的搜一搜结果页",
         )
         self.assertEqual(pin.call_count, 2)
-        normalize.assert_called_once_with(recovered, "测试公众号")
+        normalize.assert_called_once_with(
+            recovered,
+            "测试公众号",
+            close_non_search_tabs=False,
+            preserve_current_search_tab=True,
+        )
 
     def test_cleanup_preserves_search_page_when_screen_changes(self) -> None:
         """页面动画造成截图差异时，搜索框仍存在就不应执行 Ctrl+W。"""
@@ -134,8 +139,8 @@ class BrowserTabCleanupTests(unittest.TestCase):
         self.assertGreaterEqual(first_tab.call_count, 2)
         self.assertGreaterEqual(activate.call_count, 4)
 
-    def test_search_tab_is_found_and_moved_back_to_first_position(self) -> None:
-        """首标签是文章时，应遍历标签并把第三个搜一搜标签移回首位。"""
+    def test_search_tab_is_found_without_reordering_tabs(self) -> None:
+        """搜一搜不在首标签时，只遍历并停留在当前已确认的标签。"""
         window = rpa.WindowInfo(
             hwnd=100,
             title="微信",
@@ -157,18 +162,43 @@ class BrowserTabCleanupTests(unittest.TestCase):
         with (
             patch.object(rpa, "activate_window"),
             patch.object(rpa, "capture_window", return_value=image),
-            patch.object(rpa, "press_ctrl_1") as first_tab,
             patch.object(rpa, "press_ctrl_tab") as next_tab,
             patch.object(rpa, "press_ctrl_shift_pageup") as move_left,
-            patch.object(rpa, "_inspect_sogou_search_results", side_effect=[missing, missing, found, found]),
+            patch.object(rpa, "_inspect_sogou_search_results", side_effect=[missing, missing, found]),
             patch.object(rpa, "log_event"),
         ):
             recovered = rpa.find_and_pin_search_tab(window, "测试公众号", max_tabs=5)
 
         self.assertTrue(recovered)
         self.assertEqual(next_tab.call_count, 2)
-        self.assertEqual(move_left.call_count, 2)
-        self.assertEqual(first_tab.call_count, 2)
+        move_left.assert_not_called()
+
+    def test_recovery_preserves_current_search_tab_without_ctrl1(self) -> None:
+        """已扫描选中的搜一搜标签不能被清理阶段的 Ctrl+1 切走。"""
+        window = rpa.WindowInfo(
+            hwnd=100,
+            title="微信",
+            class_name="Chrome_WidgetWin_0",
+            rect=rpa.Rect(0, 0, 1000, 800),
+        )
+        image = Image.new("RGB", (1000, 800), "white")
+
+        with (
+            patch.object(rpa, "activate_window"),
+            patch.object(rpa, "capture_window", side_effect=[image, image]),
+            patch.object(rpa, "press_ctrl_1") as first_tab,
+            patch.object(rpa, "_inspect_sogou_search_results", return_value={"found": True}),
+            patch.object(rpa, "log_event"),
+        ):
+            removed = rpa.keep_only_search_tab(
+                window,
+                "测试公众号",
+                close_non_search_tabs=False,
+                preserve_current_search_tab=True,
+            )
+
+        self.assertEqual(removed, 0)
+        first_tab.assert_not_called()
 
     def test_direct_close_keeps_search_tab_without_global_probe(self) -> None:
         """文章正常采集后应直接关当前标签，不触发全量标签轮询。"""

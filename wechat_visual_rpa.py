@@ -696,8 +696,9 @@ def recreate_sogou_search_window(
     )
     recovered = arrange_automation_window(recovered, "browser")
     activate_window(recovered.hwnd)
-    press_ctrl_1()
-    time.sleep(0.8)
+    # 新窗口通常只有一个标签；不再依赖 Ctrl+1，也不尝试调整标签顺序。
+    # 后续由页面 OCR 确认当前标签，避免快捷键失效时把页面切走。
+    time.sleep(0.3)
     log_event(
         "search_page_recovery_finished",
         account=account_name,
@@ -975,10 +976,13 @@ def find_and_pin_search_tab(
     *,
     max_tabs: int = 20,
 ) -> bool:
-    """遍历现有标签找到真正的搜一搜结果页，并将它移动到第一个标签。"""
+    """遍历现有标签找到真正的搜一搜页，并停留在已确认的当前标签。
+
+    函数名保留是为了兼容已有调用方，但 Win11 微信环境不再尝试使用
+    Ctrl+Shift+PageUp 移动标签。该快捷键在当前键盘/微信组合下不可可靠验证，
+    强行发送会产生“已归位”的假成功，随后可能把资料页或文章页误当成搜索页。
+    """
     activate_window(search_window.hwnd)
-    press_ctrl_1()
-    time.sleep(0.35)
     for index in range(max_tabs):
         screenshot = capture_window(search_window.rect)
         evidence = _inspect_sogou_search_results(screenshot)
@@ -991,27 +995,12 @@ def find_and_pin_search_tab(
             account_tab_found=bool(evidence["account_tab"].get("found")),
         )
         if evidence["found"]:
-            # Chromium 用 Ctrl+Shift+PageUp 将当前标签逐格向左移动。
-            for _ in range(index):
-                activate_window(search_window.hwnd)
-                press_ctrl_shift_pageup()
-                time.sleep(0.12)
-            activate_window(search_window.hwnd)
-            press_ctrl_1()
-            time.sleep(0.35)
-            validation = _inspect_sogou_search_results(capture_window(search_window.rect))
-            if not validation["found"]:
-                log_event(
-                    "sogou_search_tab_pin_failed",
-                    account=account_name,
-                    original_tab_index=index + 1,
-                )
-                return False
             log_event(
-                "sogou_search_tab_pinned",
+                "sogou_search_tab_selected",
                 account=account_name,
-                original_tab_index=index + 1,
-                moved_left=index,
+                observed_tab_index=index + 1,
+                strategy="preserve-current-tab",
+                tab_reorder="disabled",
             )
             return True
         activate_window(search_window.hwnd)
@@ -1031,12 +1020,18 @@ def keep_only_search_tab(
     output_dir: Path | None = None,
     *,
     close_non_search_tabs: bool = True,
+    preserve_current_search_tab: bool = False,
 ) -> int:
-    """按阶段清理浏览器标签；搜索初始化阶段可只确认而不关闭未知页面。"""
+    """确认当前搜一搜标签；默认不改变标签顺序。
+
+    ``preserve_current_search_tab`` 用于前一步已经通过标签扫描选中的搜一搜页。
+    这时禁止 Ctrl+1，避免把当前搜一搜切换成资料页/文章页。生产流程目前关闭
+    ``close_non_search_tabs``，未知标签统一保留，文章标签由逐篇安全关闭负责。
+    """
     activate_window(search_window.hwnd)
-    # 搜一搜约定固定在首标签。每轮从首标签重新建立基准，再跳到最右侧标签清理，
-    # 避免文章页或分享弹窗里的输入框被误识别成搜一搜搜索框后提前停止。
-    press_ctrl_1()
+    if not preserve_current_search_tab:
+        press_ctrl_1()
+        time.sleep(0.35)
     time.sleep(0.35)
     baseline = capture_window(search_window.rect)
     if not _inspect_sogou_search_results(baseline)["found"]:
@@ -1064,6 +1059,15 @@ def keep_only_search_tab(
             reason="search_initialization_preserves_profile_and_unknown_tabs",
         )
         return 0
+    if preserve_current_search_tab:
+        # 已知搜索页不是首标签时，不能在清理未知标签的过程中用 Ctrl+1
+        # 重新定位；这会把当前页面切走。生产恢复路径宁可保留现场。
+        log_event(
+            "browser_tabs_preserved",
+            account=account_name,
+            reason="current_search_tab_preserved_without_reordering",
+        )
+        return 0
     removed = 0
     for index in range(20):
         # 每次按键前重新激活同一个 HWND，防止远程桌面或公众号资料窗口抢走焦点。
@@ -1088,7 +1092,7 @@ def keep_only_search_tab(
         # 只有一个标签时 Ctrl+9 不会切页，截图差异仅来自光标或轻微动画。
         if difference < 0.35:
             break
-        # 搜索结果页的动态内容会造成中等截图差异；只有差异较小且仍识别到搜索框时才保护首标签。
+        # 搜索结果页的动态内容会造成中等截图差异；只有差异较小且仍识别到搜索框时才保护当前搜索标签。
         # 文章分享弹窗同样含搜索框，但与搜一搜基准差异通常显著，不能据此放弃清理。
         if candidate_is_search_page and difference <= single_tab_threshold:
             log_event(
@@ -1105,7 +1109,7 @@ def keep_only_search_tab(
         time.sleep(0.35)
         if not user32.IsWindow(search_window.hwnd):
             raise RuntimeError("清理浏览器标签时搜一搜窗口被意外关闭")
-        # 关闭最右侧标签后可能落在另一个文章标签，必须显式回到首标签再校验。
+        # 关闭候选标签后可能落在另一个文章标签，必须显式回到搜索标签再校验。
         activate_window(search_window.hwnd)
         press_ctrl_1()
         time.sleep(0.35)
@@ -1122,7 +1126,7 @@ def keep_only_search_tab(
 
 
 def close_article_tabs_until_search(account_name: str) -> None:
-    """先定位并固定搜索标签，再关闭其他标签，绝不盲目连关。"""
+    """定位并保留已确认的搜索标签，不依赖标签移动或首标签快捷键。"""
     # 只能从明确识别为搜一搜的窗口开始清理，禁止把任意微信窗口当作搜索窗口。
     search_window = find_sogou_search_window()
     if not find_and_pin_search_tab(search_window, account_name):
@@ -1140,12 +1144,21 @@ def close_article_tabs_until_search(account_name: str) -> None:
             account=account_name,
             recovered_hwnd=search_window.hwnd,
         )
-    closed = keep_only_search_tab(search_window, account_name)
+    # 搜索标签可能不是第一个。当前环境不可靠支持标签移动，因此恢复阶段
+    # 只保留当前已确认页面，未知标签不做批量关闭，避免误关资料页。
+    closed = keep_only_search_tab(
+        search_window,
+        account_name,
+        close_non_search_tabs=False,
+        preserve_current_search_tab=True,
+    )
     log_event(
-        "article_tabs_closed",
+        "article_tabs_cleanup_finished",
         account=account_name,
         closed=closed,
         search_tab_preserved=True,
+        unknown_tabs_preserved=True,
+        tab_reorder="disabled",
     )
 
 
@@ -1448,7 +1461,7 @@ def activate_embedded_profile_tab(
 
 
 def press_ctrl_shift_pageup() -> None:
-    """将当前 Chromium 标签向左移动一格，用于动态固定搜一搜标签。"""
+    """历史兼容函数：当前 Win11 流程不调用标签移动快捷键。"""
     user32.keybd_event(0x11, 0, 0, 0)
     user32.keybd_event(0x10, 0, 0, 0)
     user32.keybd_event(0x21, 0, 0, 0)
@@ -2974,13 +2987,14 @@ def search_and_open_profile(
         )
     search_window = arrange_automation_window(search_window, "browser")
     activate_window(search_window.hwnd)
-    # 正常情况下搜一搜位于首标签；若远端电脑曾中断或人工改过标签顺序，先动态找回并归位。
-    press_ctrl_1()
+    # 不再假设搜一搜位于首标签，也不发送标签移动快捷键。Win11 微信中资料页、
+    # 文章页和搜一搜可能共存于同一窗口，后续通过页面 OCR 扫描并停留在正确标签。
     output_dir.mkdir(parents=True, exist_ok=True)
     search_box: dict[str, Any] = {"found": False}
     before: Image.Image | None = None
     search_page_recreated = False
     search_page_ready_without_recovery = False
+    search_tab_is_current = False
     for recovery_index in range(9):
         before = capture_window(search_window.rect)
         before.save(output_dir / f"before-search-{recovery_index:02d}.png")
@@ -2994,6 +3008,7 @@ def search_and_open_profile(
         )
         if search_box.get("found"):
             search_page_ready_without_recovery = _SEARCH_WINDOW_HOT and recovery_index == 0
+            search_tab_is_current = True
             break
         if recovery_index == 1 and not search_page_recreated:
             if find_and_pin_search_tab(search_window, account_name):
@@ -3003,12 +3018,13 @@ def search_and_open_profile(
                     recovered_hwnd=search_window.hwnd,
                     method="existing-tab-scan",
                 )
+                search_tab_is_current = True
                 continue
             # 所有现有标签都不是搜一搜，才从微信主窗口重建，避免无谓关闭整个浏览器。
             search_window = recreate_sogou_search_window(
                 search_window,
                 account_name,
-                str(search_box.get("reason") or "首标签不是搜一搜页面"),
+                str(search_box.get("reason") or "当前标签不是搜一搜页面"),
             )
             _SEARCH_WINDOW_HOT = False
             # 页面标签被文章窗口替换时会重新拉起搜一搜；记录这一步便于定位后续失败发生在哪个阶段。
@@ -3019,10 +3035,10 @@ def search_and_open_profile(
                 recovery_index=recovery_index,
             )
             search_page_recreated = True
+            search_tab_is_current = True
             continue
-        # 只重复回到首标签并等待页面稳定，禁止盲目 Ctrl+W 误关搜索页。
+        # 只等待当前标签稳定；不再用 Ctrl+1 假设搜索页位于首标签。
         activate_window(search_window.hwnd)
-        press_ctrl_1()
         press_escape()
         time.sleep(0.5)
     if before is not None:
@@ -3030,13 +3046,13 @@ def search_and_open_profile(
     if not search_box.get("found"):
         raise RuntimeError(str(search_box.get("reason") or "无法定位搜一搜搜索框"))
     # 搜索初始化阶段只确认当前页面是搜一搜，不关闭已有公众号资料页或未知标签。
-    # 上一账号已安全回到首个搜一搜标签时，直接复用热窗口，跳过重复的双截图校准；
-    # 只有发生标签恢复或首标签不确定时才执行完整确认。
+    # 上一账号已安全回到当前搜一搜标签时，直接复用热窗口，跳过重复的双截图校准；
+    # 只有发生标签恢复或当前标签不确定时才执行完整确认。
     if search_page_ready_without_recovery:
         log_event(
             "search_window_hot_reused",
             account=account_name,
-            reason="首标签已确认包含搜一搜搜索框，保留现有标签状态",
+            reason="当前标签已确认包含搜一搜搜索框，保留现有标签状态",
         )
     else:
         keep_only_search_tab(
@@ -3044,6 +3060,7 @@ def search_and_open_profile(
             account_name,
             output_dir,
             close_non_search_tabs=False,
+            preserve_current_search_tab=search_tab_is_current,
         )
     before = capture_window(search_window.rect)
     search_box = PROFILE_OCR.locate_search_box(before)
@@ -3603,11 +3620,10 @@ def search_and_open_profile(
                 )
                 if not search_page.get("found"):
                     activate_window(search_window.hwnd)
-                    press_ctrl_1()
-                    time.sleep(0.08)
-                    search_page = _inspect_sogou_search_results(
-                        capture_window(search_window.rect)
-                    )
+                    if find_and_pin_search_tab(search_window, account_name, max_tabs=12):
+                        search_page = _inspect_sogou_search_results(
+                            capture_window(search_window.rect)
+                        )
                 if not search_page.get("found"):
                     raise RuntimeError("资料页重试前无法安全回到搜一搜结果页")
                 avatar_x = search_window.rect.left + round(
@@ -3682,11 +3698,10 @@ def search_and_open_profile(
                 )
                 if not search_page.get("found"):
                     activate_window(search_window.hwnd)
-                    press_ctrl_1()
-                    time.sleep(0.35)
-                    search_page = _inspect_sogou_search_results(
-                        capture_window(search_window.rect)
-                    )
+                    if find_and_pin_search_tab(search_window, account_name, max_tabs=12):
+                        search_page = _inspect_sogou_search_results(
+                            capture_window(search_window.rect)
+                        )
                 if not search_page.get("found"):
                     raise RuntimeError("资料页重试前无法安全回到搜一搜结果页")
                 avatar_x = search_window.rect.left + round(

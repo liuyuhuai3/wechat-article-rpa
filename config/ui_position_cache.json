@@ -7,7 +7,7 @@
     "window_width": 1100,
     "window_height": 1324,
     "source": "cache-validated",
-    "updated_at": "2026-08-29T02:09:14+08:00"
+    "updated_at": "2026-08-29T13:57:31+08:00"
   },
   "menu_button": {
     "center_x_1000": 778,
@@ -16,6 +16,6 @@
     "window_width": 1100,
     "window_height": 1324,
     "source": "cached-menu-button-opencv",
-    "updated_at": "2026-08-29T02:09:14+08:00"
+    "updated_at": "2026-08-29T13:57:31+08:00"
   }
 }
