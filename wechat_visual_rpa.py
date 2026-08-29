@@ -84,6 +84,9 @@ RUN_LOGGER = logging.getLogger("wechat_rpa")
 WINDOW_LAYOUT_MODE = "auto"
 # 仅在上一个账号完成闭环后启用的进程内热状态。首次启动或恢复流程仍走完整确认。
 _SEARCH_WINDOW_HOT = False
+# 多账号监听的进程内资料页缓存。缓存只保存当前进程中的 WindowInfo；
+# HWND 和标签位置不跨微信/虚拟机重启复用，重启后必须重新搜索并验证。
+_WATCH_PROFILE_CACHE: dict[str, "WindowInfo"] = {}
 # 微信 3.x/4.x 及其内置 Chromium 子进程可能使用不同可执行文件名。
 # 普通 chrome.exe/msedge.exe 即使窗口标题恰好为“微信”，也绝不能进入自动化范围。
 WECHAT_PROCESS_NAMES = frozenset(
@@ -1409,6 +1412,14 @@ def press_ctrl_home() -> None:
     user32.keybd_event(0x11, 0, 0x0002, 0)
 
 
+def press_ctrl_r() -> None:
+    """刷新当前已确认的微信内置浏览器标签。"""
+    user32.keybd_event(0x11, 0, 0, 0)
+    user32.keybd_event(0x52, 0, 0, 0)
+    user32.keybd_event(0x52, 0, 0x0002, 0)
+    user32.keybd_event(0x11, 0, 0x0002, 0)
+
+
 def press_ctrl_w() -> None:
     user32.keybd_event(0x11, 0, 0, 0)
     user32.keybd_event(0x57, 0, 0, 0)
@@ -1458,6 +1469,85 @@ def activate_embedded_profile_tab(
         expected_name,
         max_tabs=max_tabs,
     )
+
+
+def refresh_verified_profile_window(
+    window: WindowInfo,
+    account_name: str,
+    *,
+    timeout_seconds: float = 12.0,
+    output_dir: Path | None = None,
+) -> bool:
+    """刷新已验证的资料页，并等待账号头部重新出现。
+
+    Ctrl+R 只能作用于当前活动标签；刷新前先按页面类型激活并校验，刷新后
+    再用资料页头部 OCR 做闸门。页面加载期间允许出现空白或旧截图，不能立即
+    把一次截图失败当作资料页丢失。
+    """
+    if not user32.IsWindow(window.hwnd):
+        log_event(
+            "profile_refresh_failed",
+            account=account_name,
+            reason="profile_window_invalid",
+        )
+        return False
+    if window.page_kind == "embedded_profile_tab":
+        if not activate_embedded_profile_tab(window, account_name):
+            log_event(
+                "profile_refresh_failed",
+                account=account_name,
+                reason="profile_tab_not_found_before_refresh",
+            )
+            return False
+    else:
+        activate_window(window.hwnd)
+    baseline = capture_window(window.rect)
+    before_validation = PROFILE_OCR.validate_profile_header(baseline, account_name)
+    if not before_validation.get("matched"):
+        log_event(
+            "profile_refresh_failed",
+            account=account_name,
+            reason="profile_identity_not_confirmed_before_refresh",
+            validation=before_validation,
+        )
+        return False
+    if output_dir is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        baseline.save(output_dir / "profile-before-refresh.png")
+    log_event("profile_refresh_requested", account=account_name, method="ctrl-r")
+    refresh_started = time.monotonic()
+    press_ctrl_r()
+    deadline = refresh_started + max(1.0, timeout_seconds)
+    first_match_at: float | None = None
+    while time.monotonic() < deadline:
+        time.sleep(0.35)
+        screenshot = capture_window(window.rect)
+        validation = PROFILE_OCR.validate_profile_header(screenshot, account_name)
+        if not validation.get("matched"):
+            first_match_at = None
+            continue
+        if first_match_at is None:
+            first_match_at = time.monotonic()
+            continue
+        # 连续两次通过头部校验，避免刚刷新时残留旧画面或加载动画误判完成。
+        if time.monotonic() - first_match_at < 0.35:
+            continue
+        if output_dir is not None:
+            screenshot.save(output_dir / "profile-after-refresh.png")
+        log_event(
+            "profile_refresh_completed",
+            account=account_name,
+            method="ctrl-r",
+            elapsed_seconds=round(max(0.0, time.monotonic() - refresh_started), 3),
+            validation=validation,
+        )
+        return True
+    log_event(
+        "profile_refresh_failed",
+        account=account_name,
+        reason="profile_identity_not_restored_after_refresh",
+    )
+    return False
 
 
 def press_ctrl_shift_pageup() -> None:
@@ -2506,6 +2596,271 @@ def watch_single_account(
         "state_path": str(state_path),
         "last_error": state.get("last_error"),
         "last_summary": state.get("last_summary"),
+    }
+
+
+def watch_multiple_accounts(
+    client: QwenVisionClient,
+    account_names: list[str],
+    output_dir: Path,
+    poll_interval_seconds: float,
+    recent_card_limit: int,
+    export_jsonl: str | None,
+    export_csv: str | None,
+    *,
+    allow_vl: bool = True,
+    write_mongo: bool = False,
+    mongo_uri: str | None = None,
+    mongo_database: str | None = None,
+    mongo_collection: str | None = None,
+    mongo_target_collection: str | None = None,
+    metric_mode: str = "share",
+    task_timeout_minutes: float | None = None,
+    watch_cycles: int = 0,
+    manual_search_fallback_seconds: float = 0.0,
+    schedule_start_minutes: int | None = None,
+    schedule_end_minutes: int | None = None,
+    max_accounts_per_vm: int = 10,
+) -> dict[str, Any]:
+    """多账号串行轮询；账号列表只有一项时等价于单账号监听。"""
+    global _WATCH_PROFILE_CACHE
+    accounts = list(dict.fromkeys(name.strip() for name in account_names if name.strip()))
+    if not accounts:
+        raise ValueError("多账号监听至少需要一个公众号")
+    if len(accounts) > max_accounts_per_vm:
+        raise ValueError(
+            f"当前虚拟机最多监听 {max_accounts_per_vm} 个账号，实际收到 {len(accounts)} 个"
+        )
+    if (schedule_start_minutes is None) != (schedule_end_minutes is None):
+        raise ValueError("监听时间窗口必须同时设置开始时间和结束时间")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    multi_account = len(accounts) > 1
+    account_dirs = {
+        account: output_dir / safe_path_name(account) if multi_account else output_dir
+        for account in accounts
+    }
+    states: dict[str, dict[str, Any]] = {}
+    known_urls: dict[str, set[str]] = {}
+    for account in accounts:
+        account_dir = account_dirs[account]
+        state = load_watch_state(account_dir / "watch-state.json", account)
+        urls = set(state.get("known_urls") or [])
+        if write_mongo:
+            try:
+                mongo_urls = load_account_article_urls(
+                    mongo_uri or os.getenv("MONGO_URI", "mongodb://192.168.28.70:27019/"),
+                    mongo_database or os.getenv("MONGO_DATABASE", "weixin"),
+                    mongo_collection or os.getenv("MONGO_ARTICLE_COLLECTION", "article"),
+                    account,
+                )
+                urls.update(mongo_urls)
+                log_event("watch_known_urls_loaded_from_mongo", account=account, count=len(mongo_urls))
+            except Exception as exc:
+                log_event("watch_known_urls_mongo_load_failed", account=account, error=str(exc))
+        state["known_urls"] = list(dict.fromkeys(urls))
+        state.setdefault("consecutive_failures", 0)
+        states[account] = state
+        known_urls[account] = urls
+        save_watch_state(account_dir / "watch-state.json", state)
+
+    scheduler_path = output_dir / "scheduler-state.json"
+    scheduler_state: dict[str, Any] = {
+        "version": 1,
+        "accounts": accounts,
+        "accounts_per_vm": max_accounts_per_vm,
+        "round_count": 0,
+        "last_error": None,
+    }
+    try:
+        previous = json.loads(scheduler_path.read_text(encoding="utf-8"))
+        if isinstance(previous, dict) and previous.get("accounts") == accounts:
+            scheduler_state.update(previous)
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        pass
+    save_watch_state(scheduler_path, scheduler_state)
+    log_event(
+        "watch_scheduler_started",
+        accounts=accounts,
+        accounts_total=len(accounts),
+        accounts_per_vm=max_accounts_per_vm,
+        poll_interval_seconds=poll_interval_seconds,
+        recent_card_limit=recent_card_limit,
+        state_path=str(scheduler_path),
+    )
+
+    pending = set(accounts)
+    next_due = {account: datetime.now(timezone.utc) for account in accounts}
+    completed_rounds = 0
+    waiting_for_start: str | None = None
+    active_window_key: str | None = None
+    try:
+        while watch_cycles == 0 or completed_rounds < watch_cycles:
+            if schedule_start_minutes is not None and schedule_end_minutes is not None:
+                now_shanghai = datetime.now(shanghai_timezone())
+                in_window, window_start, window_end = watch_window_state(
+                    now_shanghai, schedule_start_minutes, schedule_end_minutes
+                )
+                window_key = window_start.isoformat()
+                if not in_window:
+                    if waiting_for_start != window_key:
+                        waiting_for_start = window_key
+                        log_event(
+                            "watch_outside_schedule",
+                            accounts=accounts,
+                            now=now_shanghai.isoformat(),
+                            next_start=window_start.isoformat(),
+                            next_end=window_end.isoformat(),
+                        )
+                    _sleep_in_chunks(min(30.0, max(1.0, (window_start - now_shanghai).total_seconds())))
+                    continue
+                waiting_for_start = None
+                if active_window_key != window_key:
+                    active_window_key = window_key
+                    scheduler_state["schedule"] = {
+                        "start": schedule_start_minutes,
+                        "end": schedule_end_minutes,
+                        "window_started_at": window_start.isoformat(),
+                    }
+                    save_watch_state(scheduler_path, scheduler_state)
+                    log_event(
+                        "watch_window_opened",
+                        accounts=accounts,
+                        window_start=window_start.isoformat(),
+                        window_end=window_end.isoformat(),
+                    )
+
+            if not pending:
+                completed_rounds += 1
+                scheduler_state["round_count"] = completed_rounds
+                scheduler_state["last_round_finished_at"] = datetime.now(timezone.utc).isoformat()
+                save_watch_state(scheduler_path, scheduler_state)
+                if watch_cycles and completed_rounds >= watch_cycles:
+                    break
+                pending = set(accounts)
+                due_at = datetime.now(timezone.utc) + timedelta(seconds=poll_interval_seconds)
+                next_due = {account: due_at for account in accounts}
+
+            now = datetime.now(timezone.utc)
+            ready = [account for account in pending if next_due[account] <= now]
+            if not ready:
+                wait_seconds = min((next_due[account] - now).total_seconds() for account in pending)
+                log_event("watch_scheduler_sleeping", seconds=round(max(0.0, wait_seconds), 3), pending_accounts=len(pending))
+                _sleep_in_chunks(min(30.0, max(1.0, wait_seconds)))
+                continue
+
+            account = min(ready, key=lambda item: next_due[item])
+            state = states[account]
+            state["cycle_count"] = max(0, int(state.get("cycle_count") or 0)) + 1
+            cycle_number = state["cycle_count"]
+            account_dir = account_dirs[account]
+            cycle_dir = account_dir / "cycles" / f"cycle-{cycle_number:05d}"
+            cycle_started = datetime.now(timezone.utc)
+            state["last_cycle_started_at"] = cycle_started.isoformat()
+            state["last_error"] = None
+            save_watch_state(account_dir / "watch-state.json", state)
+            log_event(
+                "watch_account_cycle_started",
+                account=account,
+                cycle=cycle_number,
+                pending_accounts=len(pending),
+                known_urls=len(known_urls[account]),
+                output_dir=str(cycle_dir),
+            )
+
+            cached_profile = _WATCH_PROFILE_CACHE.get(account)
+            try:
+                summary = collect_profile_account(
+                    client,
+                    account,
+                    cycle_dir,
+                    recent_card_limit,
+                    export_jsonl,
+                    export_csv,
+                    allow_vl=allow_vl,
+                    write_mongo=write_mongo,
+                    mongo_uri=mongo_uri,
+                    mongo_database=mongo_database,
+                    mongo_collection=mongo_collection,
+                    mongo_target_collection=mongo_target_collection,
+                    metric_mode=metric_mode,
+                    task_timeout_minutes=task_timeout_minutes,
+                    scan_range="today",
+                    recent_card_limit=recent_card_limit,
+                    known_urls=known_urls[account],
+                    stop_after_known_url=True,
+                    manual_search_fallback_seconds=manual_search_fallback_seconds,
+                    reuse_profile_window=cached_profile,
+                    preserve_profile=True,
+                    refresh_profile=cached_profile is not None,
+                )
+                cycle_urls = _summary_urls(summary)
+                new_urls = cycle_urls - known_urls[account]
+                known_urls[account].update(cycle_urls)
+                state["known_urls"] = list(dict.fromkeys(known_urls[account]))
+                state["last_summary"] = {
+                    "cycle": cycle_number,
+                    "detected_articles": summary.get("detected_articles", 0),
+                    "stop_reason": summary.get("stop_reason"),
+                    "new_articles": len(new_urls),
+                    "failures": len(summary.get("failures") or []),
+                }
+                state["consecutive_failures"] = 0
+                log_event(
+                    "watch_account_cycle_finished",
+                    account=account,
+                    cycle=cycle_number,
+                    duration_seconds=round((datetime.now(timezone.utc) - cycle_started).total_seconds(), 3),
+                    new_articles=len(new_urls),
+                    known_url_stop=bool(summary.get("dedupe", {}).get("known_url_stop")),
+                    failures=len(summary.get("failures") or []),
+                    stop_reason=summary.get("stop_reason"),
+                )
+            except Exception as exc:
+                _WATCH_PROFILE_CACHE.pop(account, None)
+                state["last_error"] = str(exc)
+                state["consecutive_failures"] = int(state.get("consecutive_failures") or 0) + 1
+                log_event(
+                    "watch_account_cycle_failed",
+                    account=account,
+                    cycle=cycle_number,
+                    error=str(exc),
+                    category=classify_collection_error(exc),
+                )
+            state["last_cycle_finished_at"] = datetime.now(timezone.utc).isoformat()
+            save_watch_state(account_dir / "watch-state.json", state)
+            pending.remove(account)
+            next_due[account] = datetime.now(timezone.utc) + timedelta(seconds=poll_interval_seconds)
+    except KeyboardInterrupt:
+        log_event("watch_scheduler_stopped", accounts=accounts, reason="keyboard_interrupt")
+    finally:
+        save_watch_state(scheduler_path, scheduler_state)
+
+    account_results = []
+    total_known_urls = 0
+    last_error = None
+    for account in accounts:
+        state = states[account]
+        total_known_urls += len(state.get("known_urls") or [])
+        last_error = state.get("last_error") or last_error
+        account_results.append(
+            {
+                "account": account,
+                "cycles": state.get("cycle_count", 0),
+                "known_urls": len(state.get("known_urls") or []),
+                "state_path": str(account_dirs[account] / "watch-state.json"),
+                "last_error": state.get("last_error"),
+                "last_summary": state.get("last_summary"),
+            }
+        )
+    return {
+        "mode": "watch",
+        "accounts": account_results,
+        "accounts_total": len(accounts),
+        "rounds": scheduler_state.get("round_count", completed_rounds),
+        "known_urls": total_known_urls,
+        "state_path": str(scheduler_path),
+        "last_error": last_error,
     }
 
 
@@ -4257,6 +4612,9 @@ def collect_profile_account(
     known_urls: set[str] | None = None,
     stop_after_known_url: bool = False,
     manual_search_fallback_seconds: float = 0.0,
+    reuse_profile_window: WindowInfo | None = None,
+    preserve_profile: bool = False,
+    refresh_profile: bool = False,
 ) -> dict[str, Any]:
     global _SEARCH_WINDOW_HOT
     log_event(
@@ -4269,7 +4627,7 @@ def collect_profile_account(
         scan_range=scan_range,
     )
     """从搜一搜进入公众号资料窗口，采集今天和昨天的文章。"""
-    profile_window: WindowInfo | None = None
+    profile_window: WindowInfo | None = reuse_profile_window
     # 数据库中的账号名是文章归属的唯一标准。搜一搜 OCR 读到的名称可能会
     # 带上“媒体”“官方”等身份后缀，只能用于搜索结果校验，不能污染文章页校验。
     observed_account_name = account_name
@@ -4341,24 +4699,64 @@ def collect_profile_account(
         temporary_path.replace(partial_summary_path)
 
     try:
-        search_error = ""
-        for attempt in range(1, 4):
+        if profile_window is not None:
             try:
-                log_event("account_search_attempt", account=account_name, attempt=attempt)
-                profile_window, observed_account_name = search_and_open_profile(
+                if not user32.IsWindow(profile_window.hwnd):
+                    raise RuntimeError("缓存资料页窗口句柄已失效")
+                if profile_window.page_kind == "embedded_profile_tab":
+                    if not activate_embedded_profile_tab(profile_window, account_name):
+                        raise RuntimeError("缓存资料页标签未找到")
+                else:
+                    activate_window(profile_window.hwnd)
+                profile_window = arrange_automation_window(profile_window, "profile")
+                if refresh_profile and not refresh_verified_profile_window(
+                    profile_window,
                     account_name,
-                    output_dir / "search" / f"attempt-{attempt}",
-                    client=client,
-                    allow_vl=allow_vl,
-                    manual_fallback_seconds=manual_search_fallback_seconds,
+                    output_dir=output_dir / "profile" / "refresh",
+                ):
+                    raise RuntimeError("缓存资料页刷新后未恢复目标账号")
+                validation = PROFILE_OCR.validate_profile_header(
+                    capture_window(profile_window.rect), account_name
                 )
-                break
+                if not validation.get("matched"):
+                    raise RuntimeError("缓存资料页账号名称校验失败")
+                log_event(
+                    "profile_tab_reused",
+                    account=account_name,
+                    page_kind=profile_window.page_kind,
+                    refreshed=refresh_profile,
+                    validation=validation,
+                )
             except Exception as exc:
-                search_error = str(exc)
-                log_event("account_search_attempt_failed", account=account_name, attempt=attempt, error=search_error)
-                time.sleep(0.8)
+                log_event(
+                    "profile_tab_reuse_failed",
+                    account=account_name,
+                    error=str(exc),
+                    action="fallback_to_search",
+                )
+                profile_window = None
+                _WATCH_PROFILE_CACHE.pop(account_name, None)
         if profile_window is None:
-            raise RuntimeError(f"搜一搜连续3次打开公众号失败：{search_error}")
+            search_error = ""
+            for attempt in range(1, 4):
+                try:
+                    log_event("account_search_attempt", account=account_name, attempt=attempt)
+                    profile_window, observed_account_name = search_and_open_profile(
+                        account_name,
+                        output_dir / "search" / f"attempt-{attempt}",
+                        client=client,
+                        allow_vl=allow_vl,
+                        manual_fallback_seconds=manual_search_fallback_seconds,
+                    )
+                    break
+                except Exception as exc:
+                    search_error = str(exc)
+                    log_event("account_search_attempt_failed", account=account_name, attempt=attempt, error=search_error)
+                    time.sleep(0.8)
+            if profile_window is None:
+                raise RuntimeError(f"搜一搜连续3次打开公众号失败：{search_error}")
+        if preserve_profile and profile_window is not None:
+            _WATCH_PROFILE_CACHE[account_name] = profile_window
         # 记录 OCR 看到的结果名，但后续文章归属仍使用 account_name。
         log_event(
             "account_identity_observed",
@@ -4648,7 +5046,16 @@ def collect_profile_account(
             time.sleep(0.4)
     finally:
         cleanup_succeeded = False
-        if profile_window and user32.IsWindow(profile_window.hwnd):
+        if preserve_profile and profile_window and user32.IsWindow(profile_window.hwnd):
+            cleanup_succeeded = True
+            _WATCH_PROFILE_CACHE[account_name] = profile_window
+            log_event(
+                "profile_tab_preserved",
+                account=account_name,
+                page_kind=profile_window.page_kind,
+                reason="multi_account_watch_cache",
+            )
+        elif profile_window and user32.IsWindow(profile_window.hwnd):
             if profile_window.page_kind == "embedded_profile_tab":
                 # 资料页是搜一搜浏览器中的活动标签，只能关闭当前标签，不能关闭
                 # 整个 Chrome_WidgetWin_0，否则会连搜索页一起退出。
@@ -4666,13 +5073,20 @@ def collect_profile_account(
             else:
                 close_window(profile_window.hwnd)
                 cleanup_succeeded = True
-        # 只有资料页清理成功并确认回到可复用会话，下一账号才允许走热路径。
-        _SEARCH_WINDOW_HOT = cleanup_succeeded
+        # 单账号旧流程以搜一搜热状态作为下一轮入口；多账号流程保留资料页缓存，
+        # 由调度器在切换时重新探测搜一搜标签，因此此时不标记搜索页热状态。
+        _SEARCH_WINDOW_HOT = cleanup_succeeded and not preserve_profile
         log_event(
             "search_window_hot_state_updated",
             account=account_name,
             enabled=_SEARCH_WINDOW_HOT,
-            reason="profile_cleanup_confirmed" if cleanup_succeeded else "profile_cleanup_not_confirmed",
+            reason=(
+                "profile_preserved_for_watch_cache"
+                if preserve_profile and cleanup_succeeded
+                else "profile_cleanup_confirmed"
+                if cleanup_succeeded
+                else "profile_cleanup_not_confirmed"
+            ),
         )
 
     summary = {
@@ -4806,7 +5220,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--collect-open-article", action="store_true", help="采集当前已打开文章")
     parser.add_argument("--run-one-account", action="store_true", help="采集当前屏指定公众号的最近文章")
     parser.add_argument("--run-search-accounts", action="store_true", help="按名称搜索公众号并采集文章")
-    parser.add_argument("--watch-account", help="常驻增量监听单个公众号；每轮只检查当天最新卡片")
+    parser.add_argument(
+        "--watch-account",
+        action="append",
+        default=[],
+        help="常驻增量监听公众号，可重复传入；单个账号是多账号调度的兼容用法",
+    )
+    parser.add_argument(
+        "--watch-accounts-file",
+        help="常驻增量监听账号文件，每行一个公众号名称，支持 # 注释",
+    )
+    parser.add_argument(
+        "--accounts-per-vm",
+        type=int,
+        default=10,
+        help="单个虚拟机最多监听账号数，默认 10",
+    )
     parser.add_argument(
         "--poll-interval",
         type=float,
@@ -4940,33 +5369,43 @@ def main() -> None:
             client = QwenVisionClient(QwenVisionConfig(base_url="", api_key=""))
             vl_available = False
             log_event("qwen_vl_unavailable", reason=str(exc))
-    if args.watch_account:
+    if args.watch_account or args.watch_accounts_file:
         if not args.live:
             raise RuntimeError("增量监听模式必须显式传入 --live")
         if args.run_search_accounts or args.run_one_account or args.collect_open_article:
-            raise RuntimeError("--watch-account 不能与其他采集入口同时使用")
+            raise RuntimeError("监听模式不能与其他采集入口同时使用")
         if args.poll_interval < 30:
             raise RuntimeError("--poll-interval 最小为 30 秒，避免高频重复操作微信")
         if args.recent_card_limit < 1:
             raise RuntimeError("--recent-card-limit 必须大于等于 1")
         if args.watch_cycles < 0:
             raise RuntimeError("--watch-cycles 不能为负数")
+        if args.accounts_per_vm < 1:
+            raise RuntimeError("--accounts-per-vm 必须大于等于 1")
         if (args.watch_start_time is None) != (args.watch_end_time is None):
             raise RuntimeError("--watch-start-time 和 --watch-end-time 必须同时传入")
-        watch_account_name = args.watch_account.strip()
-        if not watch_account_name:
-            raise RuntimeError("--watch-account 不能为空")
+        watch_account_names = load_account_names(
+            args.watch_account,
+            args.watch_accounts_file,
+        )
+        if not watch_account_names:
+            raise RuntimeError("请通过 --watch-account 或 --watch-accounts-file 提供公众号名称")
+        if len(watch_account_names) > args.accounts_per_vm:
+            raise RuntimeError(
+                f"当前虚拟机最多监听 {args.accounts_per_vm} 个账号，"
+                f"实际收到 {len(watch_account_names)} 个"
+            )
         watch_output_dir = Path(args.output_dir)
         watch_output_dir.mkdir(parents=True, exist_ok=True)
         if not args.write_mongo:
             log_event(
                 "watch_persistence_local_only",
-                account=watch_account_name,
+                accounts=watch_account_names,
                 reason="未传入 --write-mongo，跨重启状态只依赖 watch-state.json",
             )
-        result = watch_single_account(
+        result = watch_multiple_accounts(
             client,
-            watch_account_name,
+            watch_account_names,
             watch_output_dir,
             args.poll_interval,
             args.recent_card_limit,
@@ -4992,13 +5431,18 @@ def main() -> None:
             manual_search_fallback_seconds=120.0 if args.manual_search_fallback else 0.0,
             schedule_start_minutes=args.watch_start_time,
             schedule_end_minutes=args.watch_end_time,
+            max_accounts_per_vm=args.accounts_per_vm,
         )
         log_event(
             "run_finished",
             mode="watch",
-            accounts_total=1,
-            accounts_failed=1 if result.get("last_error") else 0,
-            cycles=result.get("cycles"),
+            accounts_total=result.get("accounts_total"),
+            accounts_failed=sum(
+                1
+                for item in result.get("accounts", [])
+                if item.get("last_error")
+            ),
+            rounds=result.get("rounds"),
             known_urls=result.get("known_urls"),
         )
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))

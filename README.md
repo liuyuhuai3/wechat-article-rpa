@@ -390,26 +390,35 @@ MONGO_URI=mongodb://127.0.0.1:27017/
   --account-name "厦门日报" --max-articles 1
 ```
 
-### 单个公众号增量监听
+### 常驻增量监听
 
 每轮只检查当天最新的几张文章卡片，遇到已经记录过的文章 URL 后停止本轮继续翻历史：
 
 ```powershell
 .\.venv\Scripts\python.exe .\wechat_visual_rpa.py `
   --watch-account "厦门日报" --live --poll-interval 300 `
-  --recent-card-limit 3 --metrics share --write-mongo `
+  --recent-card-limit 3 --metrics share `
   --output-dir ".\output\watch-xiamen"
 ```
 
-监听状态保存在 `watch-state.json`，每轮结果保存在 `cycles` 子目录。首次验证可增加
-`--watch-cycles 2 --poll-interval 30`；监听模式目前只支持单个账号，123 个账号的调度需要后续版本。
+单账号是多账号调度器的兼容用法。多个账号可放入文本文件，每行一个名称：
+
+```powershell
+.\.venv\Scripts\python.exe .\wechat_visual_rpa.py `
+  --watch-accounts-file ".\config\watch-accounts.txt" --live `
+  --accounts-per-vm 10 --poll-interval 600 --recent-card-limit 3 `
+  --metrics share --output-dir ".\output\watch-vm-01"
+```
+
+多账号监听会保留一个常驻搜一搜标签和最多 10 个已验证资料页标签，按账号串行轮询；每个账号独立保存 `watch-state.json`，根目录保存 `scheduler-state.json`。首次验证可增加
+`--watch-cycles 2 --poll-interval 30`。
 
 每天定时在 07:30～24:00 之间监听：
 
 ```powershell
 .\.venv\Scripts\python.exe .\wechat_visual_rpa.py `
   --watch-account "厦门日报" --live --watch-start-time 07:30 --watch-end-time 24:00 `
-  --poll-interval 600 --recent-card-limit 10 --metrics share --write-mongo `
+  --poll-interval 600 --recent-card-limit 10 --metrics share `
   --output-dir ".\output\watch-xiamen-day"
 ```
 

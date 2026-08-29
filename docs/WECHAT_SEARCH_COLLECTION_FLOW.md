@@ -308,19 +308,26 @@ URL 规范化会统一协议、域名大小写、查询参数顺序并移除片�
 
 ## 10. 增量监听模式
 
-第一优先级已实现单账号常驻增量监听。后续多账号能力应作为该监听能力的调度升级，不另起一套采集流程：复用同一套 Win11 搜一搜→公众号资料页→文章详情页闭环，但每轮只检查当天最新的有限数量卡片，避免每次从历史文章重新翻页。
+常驻监听统一由多账号调度器负责。单账号监听是账号列表只有一项的兼容场景，仍复用同一套 Win11 搜一搜→公众号资料页→文章详情页闭环；每轮只检查当天最新的有限数量卡片，避免每次从历史文章重新翻页。
 
 ### 10.1 启动命令
 
 ```powershell
-.venv\Scripts\python.exe wechat_visual_rpa.py --watch-account "厦门日报" --live --poll-interval 300 --recent-card-limit 3 --metrics share --write-mongo --output-dir ".\output\watch-xiamen"
+.venv\Scripts\python.exe wechat_visual_rpa.py --watch-account "厦门日报" --live --poll-interval 300 --recent-card-limit 3 --metrics share --output-dir ".\output\watch-xiamen"
 ```
 
-- `--watch-account` 只接受一个公众号；监听模式自动使用 `today`，不使用 `--scan-range` 的其他值。
+- `--watch-account` 可重复传入；也可以使用 `--watch-accounts-file`，每行一个公众号。只有一个账号时，调度器仍保持单账号目录和状态文件兼容。
+- `--accounts-per-vm` 是单个虚拟机允许的账号上限，默认 10；超过上限应拆分到另一台虚拟机。
 - `--poll-interval` 是两轮之间的间隔，最小 30 秒，默认 300 秒。
 - `--recent-card-limit` 是每轮最多检查的当天文章卡片数，默认 3；它不是成功文章数。
-- `--watch-cycles 1` 或 `--watch-cycles 2` 用于有限轮数测试；默认 `0` 表示持续运行，按 `Ctrl-C` 停止。
+- `--watch-cycles 1` 或 `--watch-cycles 2` 表示完成 1 或 2 个账号轮询周期；默认 `0` 表示持续运行，按 `Ctrl-C` 停止。
 - 建议生产运行传入 `--write-mongo`。不传时仍会本地导出，但跨重启去重主要依赖状态文件。
+
+单虚拟机监听多个账号：
+
+```powershell
+.venv\Scripts\python.exe wechat_visual_rpa.py --watch-accounts-file ".\config\watch-accounts.txt" --live --accounts-per-vm 10 --poll-interval 600 --recent-card-limit 3 --metrics share --output-dir ".\output\watch-vm-01"
+```
 
 若需要每天 07:30 到 24:00 采集，增加时间窗口参数：
 
@@ -363,9 +370,24 @@ output/watch-xiamen/
     └── cycle-00002/summary.json
 ```
 
+多账号监听时，每个账号使用独立子目录，根目录额外保存调度器状态：
+
+```text
+output/watch-vm-01/
+├── scheduler-state.json
+├── articles.jsonl
+├── articles.csv
+├── 厦门日报/
+│   ├── watch-state.json
+│   └── cycles/
+└── 量子位/
+    ├── watch-state.json
+    └── cycles/
+```
+
 启动时若启用 `--write-mongo`，监听器还会从 `weixin.article` 按账号读取已有 URL，补充本地状态。文章详情页得到的规范化 URL 是唯一去重依据；标题 OCR 不参与跨轮次去重。
 
-关键监听日志包括：`watch_started`、`watch_window_opened`、`watch_outside_schedule`、`watch_cycle_started`、`watch_cycle_finished`、`watch_window_closed`、`watch_sleeping`、`watch_cycle_failed`、`watch_stopped` 和 `incremental_known_url_stop`。
+关键监听日志包括：`watch_scheduler_started`、`watch_account_cycle_started`、`watch_account_cycle_finished`、`watch_scheduler_sleeping`、`profile_tab_reused`、`profile_refresh_requested`、`profile_refresh_completed`、`profile_refresh_failed`、`profile_tab_preserved`、`watch_window_opened`、`watch_outside_schedule`、`watch_window_closed`、`watch_scheduler_stopped` 和 `incremental_known_url_stop`。
 
 ### 10.4 有限测试
 
@@ -375,9 +397,9 @@ output/watch-xiamen/
 .venv\Scripts\python.exe wechat_visual_rpa.py --watch-account "厦门日报" --live --watch-cycles 2 --poll-interval 30 --recent-card-limit 3 --metrics share --output-dir ".\output\watch-smoke-win11"
 ```
 
-检查 `watch-state.json` 的 `cycle_count` 是否为 2，以及第二轮 `summary` 是否出现 `known_url_stop` 或按卡片上限结束。该模式目前是单账号监听能力；多账号调度设计见下文 10.5，尚未替换当前命令行入口。
+单账号测试时检查 `watch-state.json` 的 `cycle_count` 是否为 2；多账号测试时检查每个账号目录中的 `watch-state.json`，以及根目录 `scheduler-state.json` 的 `round_count` 是否为 2。每个账号的摘要应出现 `known_url_stop` 或按卡片上限结束。
 
-### 10.5 多账号常驻调度（单账号监听的升级路径）
+### 10.5 多账号常驻调度（当前常驻监听实现）
 
 多账号监听不是同时控制多个微信页面，而是在现有 `watch_single_account` 的单轮逻辑之上增加账号调度器。一个微信窗口同一时间只允许一个 UI 任务操作，调度器按账号的 `next_check_at` 串行分配任务。
 
@@ -447,7 +469,7 @@ flowchart TD
 
 一台虚拟机保留 10 个账号是资源和稳定性的初始上限，不是代码中的永久硬限制。必须以 Win11 固定微信版本实测每轮耗时后再调整。若每个账号热路径平均耗时 20～30 秒，10 个账号一轮约需 3～5 分钟；若仍然走每轮完整搜索流程，10 个账号可能超过 10 分钟，不能宣称达到 10 分钟轮询目标。
 
-本节是调度器升级设计，不代表当前已经支持多账号常驻命令。实现时应先把现有 `watch_single_account` 拆成“单账号一次检查任务”，再增加调度循环；单账号的 URL 去重、页面校验、失败清理和输出格式保持不变。
+多账号调度器已作为当前常驻监听入口实现。现有 `watch_single_account` 保留为代码兼容函数，命令行的单账号和多账号监听均进入统一的账号调度路径；单账号的 URL 去重、页面校验、失败清理和输出格式保持不变。
 
 ## 11. 维护规则
 
