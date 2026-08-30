@@ -87,6 +87,26 @@ _SEARCH_WINDOW_HOT = False
 # 多账号监听的进程内资料页缓存。缓存只保存当前进程中的 WindowInfo；
 # HWND 和标签位置不跨微信/虚拟机重启复用，重启后必须重新搜索并验证。
 _WATCH_PROFILE_CACHE: dict[str, "WindowInfo"] = {}
+_WATCH_PROFILE_TRANSITIONS: dict[tuple[str, str], int] = {}
+_WATCH_ACTIVE_PROFILE_ACCOUNT: str | None = None
+_WATCH_PROFILE_SCAN_STATE: dict[str, dict[str, Any]] = {}
+_WATCH_PROFILE_REBUILD_LOCKS: set[str] = set()
+_SEARCH_SCAN_RECOVERED_PROFILE: dict[str, "WindowInfo"] = {}
+# Win11 微信资料页和搜一搜共享 Chromium 标签栏。探测次数是从当前活动标签
+# 开始的相对次数，不是绝对标签序号；96 只作为异常防死循环上限。正常失败
+# 必须以“从同一搜一搜工作面出发并再次返回该工作面”证明完整绕行一圈，不能
+# 再把固定次数用作“目标标签不存在”的事实依据。
+WIN11_MAX_TAB_SCAN = 96
+
+
+class ProfileTemporarilyUnverifiedError(RuntimeError):
+    """资料页暂时无法确认，但尚未完成可靠整圈扫描，禁止重建。"""
+
+
+def mark_watch_profile_active(account_name: str | None) -> None:
+    """记录当前活动资料页；搜索或未知页面传入 ``None`` 使路由失效。"""
+    global _WATCH_ACTIVE_PROFILE_ACCOUNT
+    _WATCH_ACTIVE_PROFILE_ACCOUNT = account_name
 # 微信 3.x/4.x 及其内置 Chromium 子进程可能使用不同可执行文件名。
 # 普通 chrome.exe/msedge.exe 即使窗口标题恰好为“微信”，也绝不能进入自动化范围。
 WECHAT_PROCESS_NAMES = frozenset(
@@ -957,6 +977,44 @@ def wait_for_visual_change(
     return latest_difference
 
 
+def wait_for_stable_frames(
+    rect: Rect,
+    *,
+    timeout_seconds: float = 2.8,
+    interval_seconds: float = 0.22,
+    threshold: float = 1.6,
+) -> Image.Image:
+    """等待连续两帧基本稳定并返回后一帧。
+
+    标签切换、刷新和 Ctrl+Home 后都可能短暂出现空白或加载动画。这里用整页
+    灰度差异确认两帧稳定；到达上限时返回最后一帧，由 OCR 决定是否属于加载
+    中间态，不能仅因等待超时就宣称标签不存在。
+    """
+    deadline = time.monotonic() + max(0.1, timeout_seconds)
+    previous = capture_window(rect)
+    while time.monotonic() < deadline:
+        time.sleep(max(0.05, interval_seconds))
+        current = capture_window(rect)
+        if previous.size == current.size:
+            difference = ImageChops.difference(
+                previous.convert("L"), current.convert("L")
+            )
+            if float(ImageStat.Stat(difference).mean[0]) <= threshold:
+                return current
+        previous = current
+    return previous
+
+
+def same_sogou_search_workspace(first: Image.Image, current: Image.Image) -> bool:
+    """确认两帧属于同一个搜一搜工作面，而非仅仅都是搜索类页面。"""
+    if not _inspect_sogou_search_results(first).get("found"):
+        return False
+    if not _inspect_sogou_search_results(current).get("found"):
+        return False
+    # 查询词和顶部导航集中在窗口上部；主体动态内容不参与绕圈判断。
+    return _tab_switch_difference(first, current) <= 10.0
+
+
 def _inspect_sogou_search_results(screenshot: Image.Image) -> dict[str, Any]:
     """验证搜一搜结果页或首页，避免关闭资料页后把首页误判为失效标签。"""
     search_box = PROFILE_OCR.locate_search_box(screenshot)
@@ -977,7 +1035,8 @@ def find_and_pin_search_tab(
     search_window: WindowInfo,
     account_name: str,
     *,
-    max_tabs: int = 20,
+    max_tabs: int = WIN11_MAX_TAB_SCAN,
+    stop_on_target_profile: bool = True,
 ) -> bool:
     """遍历现有标签找到真正的搜一搜页，并停留在已确认的当前标签。
 
@@ -987,7 +1046,36 @@ def find_and_pin_search_tab(
     """
     activate_window(search_window.hwnd)
     for index in range(max_tabs):
-        screenshot = capture_window(search_window.rect)
+        screenshot = wait_for_stable_frames(search_window.rect)
+        profile_validation = PROFILE_OCR.validate_profile_header(
+            screenshot, account_name
+        )
+        if profile_validation.get("profile_structure_found") and not profile_validation.get("matched"):
+            press_ctrl_home()
+            screenshot = wait_for_stable_frames(search_window.rect)
+            profile_validation = PROFILE_OCR.validate_profile_header(
+                screenshot, account_name
+            )
+        if profile_validation.get("matched") and stop_on_target_profile:
+            recovered = WindowInfo(
+                search_window.hwnd,
+                search_window.title,
+                search_window.class_name,
+                search_window.rect,
+                search_window.process_name,
+                "embedded_profile_tab",
+            )
+            _SEARCH_SCAN_RECOVERED_PROFILE[account_name] = recovered
+            _WATCH_PROFILE_CACHE[account_name] = recovered
+            mark_watch_profile_active(account_name)
+            log_event(
+                "search_recovery_target_profile_reused",
+                account=account_name,
+                tab_index=index + 1,
+                validation=profile_validation,
+                action="cancel_search_rebuild",
+            )
+            return False
         evidence = _inspect_sogou_search_results(screenshot)
         log_event(
             "sogou_search_tab_probe",
@@ -1015,6 +1103,106 @@ def find_and_pin_search_tab(
         inspected_tabs=max_tabs,
     )
     return False
+
+
+def deduplicate_account_profile_tabs(
+    browser_window: WindowInfo,
+    account_name: str,
+    *,
+    max_tabs: int = WIN11_MAX_TAB_SCAN,
+) -> dict[str, Any]:
+    """从搜一搜工作面绕行一圈，只关闭同账号的精确重复资料页。"""
+    if not find_and_pin_search_tab(
+        browser_window,
+        account_name,
+        max_tabs=max_tabs,
+        stop_on_target_profile=False,
+    ):
+        result = {
+            "completed_cycle": False,
+            "primary_found": False,
+            "duplicates_closed": 0,
+            "reason": "confirmed_search_workspace_not_found",
+        }
+        log_event("profile_account_dedup_skipped", account=account_name, **result)
+        return result
+
+    search_anchor = wait_for_stable_frames(browser_window.rect)
+    primary_found = False
+    duplicates_closed = 0
+    press_ctrl_tab()
+    time.sleep(0.35)
+    for probe_index in range(max_tabs):
+        screenshot = wait_for_stable_frames(browser_window.rect)
+        if (
+            _inspect_sogou_search_results(screenshot).get("found")
+            and same_sogou_search_workspace(search_anchor, screenshot)
+        ):
+            result = {
+                "completed_cycle": True,
+                "primary_found": primary_found,
+                "duplicates_closed": duplicates_closed,
+                "reason": "returned_to_confirmed_search_workspace",
+            }
+            mark_watch_profile_active(None)
+            log_event("profile_account_dedup_finished", account=account_name, **result)
+            return result
+
+        validation = PROFILE_OCR.validate_profile_header(screenshot, account_name)
+        if validation.get("profile_structure_found") and not validation.get("matched"):
+            press_ctrl_home()
+            screenshot = wait_for_stable_frames(browser_window.rect)
+            validation = PROFILE_OCR.validate_profile_header(screenshot, account_name)
+        if validation.get("matched"):
+            if not primary_found:
+                primary_found = True
+                _WATCH_PROFILE_CACHE[account_name] = WindowInfo(
+                    browser_window.hwnd,
+                    browser_window.title,
+                    browser_window.class_name,
+                    browser_window.rect,
+                    browser_window.process_name,
+                    "embedded_profile_tab",
+                )
+                log_event(
+                    "profile_account_primary_selected",
+                    account=account_name,
+                    probe_index=probe_index + 1,
+                    validation=validation,
+                )
+            else:
+                # validate_profile_header 已同时证明：名称精确匹配、资料页结构
+                # 成立、不是搜一搜页。文章页不具备该导航结构，因此不会被关闭。
+                press_ctrl_w()
+                duplicates_closed += 1
+                time.sleep(0.35)
+                log_event(
+                    "profile_account_duplicate_closed",
+                    account=account_name,
+                    probe_index=probe_index + 1,
+                    duplicates_closed=duplicates_closed,
+                )
+                # 关闭后浏览器激活哪个相邻标签不稳定。立即结束本轮，下一次从
+                # 已确认搜一搜工作面重新开始，避免把主标签误当成下一重复页。
+                result = {
+                    "completed_cycle": False,
+                    "primary_found": True,
+                    "duplicates_closed": duplicates_closed,
+                    "reason": "one_duplicate_closed_restart_from_search_required",
+                }
+                log_event("profile_account_dedup_partial", account=account_name, **result)
+                return result
+        press_ctrl_tab()
+        time.sleep(0.35)
+
+    result = {
+        "completed_cycle": False,
+        "primary_found": primary_found,
+        "duplicates_closed": duplicates_closed,
+        "reason": "safety_limit_before_returning_to_search_workspace",
+    }
+    log_event("profile_account_dedup_incomplete", account=account_name, **result)
+    return result
 
 
 def keep_only_search_tab(
@@ -1133,6 +1321,14 @@ def close_article_tabs_until_search(account_name: str) -> None:
     # 只能从明确识别为搜一搜的窗口开始清理，禁止把任意微信窗口当作搜索窗口。
     search_window = find_sogou_search_window()
     if not find_and_pin_search_tab(search_window, account_name):
+        recovered_profile = _SEARCH_SCAN_RECOVERED_PROFILE.pop(account_name, None)
+        if recovered_profile is not None:
+            log_event(
+                "article_tab_cleanup_stopped_at_target_profile",
+                account=account_name,
+                action="preserve_profile_and_cancel_search_recovery",
+            )
+            return
         # 搜索标签可能已被异常流程关闭或替换。此时不在旧窗口里继续盲目 Ctrl+W，
         # 也不销毁旧窗口；只尝试从微信主窗口无损打开一个新的搜一搜页。
         search_window = recreate_sogou_search_window(
@@ -1141,6 +1337,14 @@ def close_article_tabs_until_search(account_name: str) -> None:
             "遍历现有标签后未找到真正的搜一搜结果页",
         )
         if not find_and_pin_search_tab(search_window, account_name, max_tabs=3):
+            recovered_profile = _SEARCH_SCAN_RECOVERED_PROFILE.pop(account_name, None)
+            if recovered_profile is not None:
+                log_event(
+                    "article_tab_cleanup_stopped_at_target_profile",
+                    account=account_name,
+                    action="preserve_profile_and_cancel_search_recovery",
+                )
+                return
             raise RuntimeError("重新创建搜一搜窗口后仍无法确认搜索页，为保护页面拒绝自动关闭标签")
         log_event(
             "article_tab_cleanup_search_recovered",
@@ -1449,13 +1653,95 @@ def press_ctrl_9() -> None:
     user32.keybd_event(0x11, 0, 0x0002, 0)
 
 
+def validate_profile_with_home_recovery(
+    window: WindowInfo,
+    expected_name: str,
+) -> tuple[Image.Image, dict[str, Any]]:
+    """先识别页面结构；名称因滚动不可见时回到顶部再精确确认。"""
+    screenshot = wait_for_stable_frames(window.rect)
+    validation = PROFILE_OCR.validate_profile_header(screenshot, expected_name)
+    if not validation.get("matched") and validation.get("profile_structure_found"):
+        press_ctrl_home()
+        screenshot = wait_for_stable_frames(window.rect)
+        validation = PROFILE_OCR.validate_profile_header(screenshot, expected_name)
+        log_event(
+            "profile_identity_retried_after_home",
+            account=expected_name,
+            matched=bool(validation.get("matched")),
+            reason=validation.get("reason"),
+        )
+    return screenshot, validation
+
+
 def activate_embedded_profile_tab(
     window: WindowInfo,
     expected_name: str,
     *,
-    max_tabs: int = 12,
+    max_tabs: int = WIN11_MAX_TAB_SCAN,
 ) -> bool:
-    """在共用浏览器窗口中按资料页内容找回目标标签。"""
+    """优先复用已学习的标签切换步数，失败时按整页身份有界恢复。"""
+    global _WATCH_ACTIVE_PROFILE_ACCOUNT
+    source_account = _WATCH_ACTIVE_PROFILE_ACCOUNT
+    learned_steps = (
+        _WATCH_PROFILE_TRANSITIONS.get((source_account, expected_name))
+        if source_account and source_account != expected_name
+        else None
+    )
+    if source_account == expected_name:
+        activate_window(window.hwnd)
+        _image, validation = validate_profile_with_home_recovery(window, expected_name)
+        if validation.get("matched"):
+            _WATCH_PROFILE_SCAN_STATE[expected_name] = {
+                "matched": True,
+                "completed_cycle": False,
+                "search_seen": False,
+                "method": "current-tab",
+            }
+            log_event(
+                "profile_tab_switch_reused_current",
+                account=expected_name,
+                validation=validation,
+            )
+            return True
+        _WATCH_ACTIVE_PROFILE_ACCOUNT = None
+        source_account = None
+    elif learned_steps is not None and learned_steps > 0:
+        activate_window(window.hwnd)
+        log_event(
+            "profile_tab_switch_requested",
+            account=expected_name,
+            source_account=source_account,
+            learned_steps=learned_steps,
+        )
+        for _ in range(learned_steps):
+            press_ctrl_tab()
+            time.sleep(0.12)
+        _image, validation = validate_profile_with_home_recovery(window, expected_name)
+        if validation.get("matched"):
+            _WATCH_PROFILE_SCAN_STATE[expected_name] = {
+                "matched": True,
+                "completed_cycle": False,
+                "search_seen": False,
+                "method": "learned-route",
+            }
+            _WATCH_ACTIVE_PROFILE_ACCOUNT = expected_name
+            log_event(
+                "profile_identity_confirmed",
+                account=expected_name,
+                method="learned-relative-tab-route",
+                validation=validation,
+            )
+            return True
+        log_event(
+            "profile_slot_recovery",
+            account=expected_name,
+            source_account=source_account,
+            reason="learned_route_destination_identity_mismatch",
+            validation=validation,
+        )
+        _WATCH_PROFILE_TRANSITIONS.pop((source_account, expected_name), None)
+        _WATCH_ACTIVE_PROFILE_ACCOUNT = None
+
     adapter = Win11WeChatAdapter(
         activate_window=activate_window,
         capture_window=capture_window,
@@ -1463,12 +1749,41 @@ def activate_embedded_profile_tab(
         press_ctrl_tab=press_ctrl_tab,
         press_ctrl_w=press_ctrl_w,
         log_event=log_event,
+        press_ctrl_home=press_ctrl_home,
+        wait_for_stable_frames=wait_for_stable_frames,
+        inspect_search_page=lambda image: bool(
+            _inspect_sogou_search_results(image).get("found")
+        ),
+        same_search_page=same_sogou_search_workspace,
     )
-    return adapter.activate_profile_tab(
+    matched = adapter.activate_profile_tab(
         window,
         expected_name,
         max_tabs=max_tabs,
     )
+    if matched:
+        if source_account and source_account != expected_name:
+            recovered_steps = (
+                (learned_steps or 0) + adapter.last_switch_steps
+                if learned_steps is not None
+                else adapter.last_switch_steps
+            )
+            if 0 < recovered_steps <= max_tabs:
+                _WATCH_PROFILE_TRANSITIONS[(source_account, expected_name)] = recovered_steps
+        _WATCH_ACTIVE_PROFILE_ACCOUNT = expected_name
+        log_event(
+            "profile_identity_confirmed",
+            account=expected_name,
+            method="bounded-viewport-ocr-scan",
+            switch_steps=adapter.last_switch_steps,
+        )
+    _WATCH_PROFILE_SCAN_STATE[expected_name] = {
+        "matched": bool(matched),
+        "completed_cycle": bool(adapter.last_scan_completed_cycle),
+        "search_seen": bool(adapter.last_scan_saw_search),
+        "method": "content-cycle-scan",
+    }
+    return matched
 
 
 def refresh_verified_profile_window(
@@ -1519,10 +1834,14 @@ def refresh_verified_profile_window(
     press_ctrl_r()
     deadline = refresh_started + max(1.0, timeout_seconds)
     first_match_at: float | None = None
+    last_screenshot = baseline
+    last_validation: dict[str, Any] = before_validation
     while time.monotonic() < deadline:
         time.sleep(0.35)
         screenshot = capture_window(window.rect)
         validation = PROFILE_OCR.validate_profile_header(screenshot, account_name)
+        last_screenshot = screenshot
+        last_validation = validation
         if not validation.get("matched"):
             first_match_at = None
             continue
@@ -1542,10 +1861,17 @@ def refresh_verified_profile_window(
             validation=validation,
         )
         return True
+    if output_dir is not None:
+        last_screenshot.save(output_dir / "profile-refresh-timeout.png")
+        (output_dir / "profile-refresh-timeout.json").write_text(
+            json.dumps(last_validation, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     log_event(
         "profile_refresh_failed",
         account=account_name,
         reason="profile_identity_not_restored_after_refresh",
+        validation=last_validation,
     )
     return False
 
@@ -2623,7 +2949,14 @@ def watch_multiple_accounts(
     max_accounts_per_vm: int = 10,
 ) -> dict[str, Any]:
     """多账号串行轮询；账号列表只有一项时等价于单账号监听。"""
-    global _WATCH_PROFILE_CACHE
+    global _WATCH_PROFILE_CACHE, _WATCH_ACTIVE_PROFILE_ACCOUNT
+    # 所有标签热状态只对当前监听进程和本次预热建立的页面池有效。
+    _WATCH_PROFILE_CACHE = {}
+    _WATCH_PROFILE_TRANSITIONS.clear()
+    _WATCH_PROFILE_SCAN_STATE.clear()
+    _WATCH_PROFILE_REBUILD_LOCKS.clear()
+    _SEARCH_SCAN_RECOVERED_PROFILE.clear()
+    _WATCH_ACTIVE_PROFILE_ACCOUNT = None
     accounts = list(dict.fromkeys(name.strip() for name in account_names if name.strip()))
     if not accounts:
         raise ValueError("多账号监听至少需要一个公众号")
@@ -2666,9 +2999,11 @@ def watch_multiple_accounts(
 
     scheduler_path = output_dir / "scheduler-state.json"
     scheduler_state: dict[str, Any] = {
-        "version": 1,
+        "version": 2,
         "accounts": accounts,
         "accounts_per_vm": max_accounts_per_vm,
+        "phase": "bootstrap_profiles",
+        "profile_registry": {},
         "round_count": 0,
         "last_error": None,
     }
@@ -2678,6 +3013,12 @@ def watch_multiple_accounts(
             scheduler_state.update(previous)
     except (FileNotFoundError, OSError, ValueError, TypeError):
         pass
+    # 旧版调度状态只记录轮数，没有资料页预热注册表；每次进程启动都必须重新
+    # 按页面内容建立资料页映射，不能复用旧 HWND、标签序号或旧的阶段状态。
+    scheduler_state["version"] = 2
+    scheduler_state["phase"] = "bootstrap_profiles"
+    scheduler_state.setdefault("profile_registry", {})
+    reuse_existing_profile_tabs = bool(scheduler_state.get("profile_registry"))
     save_watch_state(scheduler_path, scheduler_state)
     log_event(
         "watch_scheduler_started",
@@ -2689,11 +3030,180 @@ def watch_multiple_accounts(
         state_path=str(scheduler_path),
     )
 
-    pending = set(accounts)
+    # 保持账号文件中的顺序。多个账号在 Windows 上可能获得完全相同的到期
+    # 时间；使用 set 会让首轮随机从中间账号开始。
+    pending = list(accounts)
+    account_order = {account: index for index, account in enumerate(accounts)}
     next_due = {account: datetime.now(timezone.utc) for account in accounts}
     completed_rounds = 0
     waiting_for_start: str | None = None
     active_window_key: str | None = None
+    profiles_bootstrapped = False
+
+    def bootstrap_profiles(reason: str) -> None:
+        """启动监听前逐个建立并验证资料页缓存。
+
+        资料页预热与文章采集分离：这里不打开文章，只把搜一搜窗口和已确认的
+        公众号资料页标签注册到内存缓存。某个账号失败时保留其他账号的资料页，
+        后续仅在该账号轮到时执行局部搜索恢复。
+        """
+        nonlocal profiles_bootstrapped
+        scheduler_state["phase"] = "bootstrap_profiles"
+        scheduler_state["bootstrap_started_at"] = datetime.now(timezone.utc).isoformat()
+        scheduler_state["bootstrap_reason"] = reason
+        save_watch_state(scheduler_path, scheduler_state)
+        log_event(
+            "watch_profile_bootstrap_started",
+            accounts=accounts,
+            accounts_total=len(accounts),
+            reason=reason,
+        )
+
+        for account in accounts:
+            account_dir = account_dirs[account]
+            bootstrap_dir = account_dir / "bootstrap"
+            bootstrap_error = ""
+            profile_window: WindowInfo | None = None
+            observed_name = account
+            for attempt in range(1, 4):
+                try:
+                    log_event(
+                        "watch_profile_bootstrap_attempt",
+                        account=account,
+                        attempt=attempt,
+                        output_dir=str(bootstrap_dir / f"attempt-{attempt}"),
+                    )
+                    if attempt == 1 and reuse_existing_profile_tabs:
+                        try:
+                            if _WATCH_PROFILE_CACHE:
+                                browser_window = next(iter(_WATCH_PROFILE_CACHE.values()))
+                            else:
+                                browser_window = find_sogou_search_window()
+                            if activate_embedded_profile_tab(
+                                browser_window,
+                                account,
+                                max_tabs=WIN11_MAX_TAB_SCAN,
+                            ):
+                                profile_window = WindowInfo(
+                                    browser_window.hwnd,
+                                    browser_window.title,
+                                    browser_window.class_name,
+                                    browser_window.rect,
+                                    browser_window.process_name,
+                                    "embedded_profile_tab",
+                                )
+                                profile_window = arrange_automation_window(
+                                    profile_window, "profile"
+                                )
+                                observed_name = account
+                                log_event(
+                                    "watch_profile_bootstrap_existing_tab_reused",
+                                    account=account,
+                                    hwnd=profile_window.hwnd,
+                                )
+                        except Exception as reuse_exc:
+                            log_event(
+                                "watch_profile_bootstrap_existing_tab_probe_failed",
+                                account=account,
+                                error=str(reuse_exc),
+                                action="continue_with_search",
+                            )
+                    if profile_window is None:
+                        profile_window, observed_name = search_and_open_profile(
+                            account,
+                            bootstrap_dir / f"attempt-{attempt}",
+                            client=client,
+                            allow_vl=allow_vl,
+                            manual_fallback_seconds=manual_search_fallback_seconds,
+                        )
+                    _WATCH_PROFILE_CACHE[account] = profile_window
+                    if profile_window.page_kind == "embedded_profile_tab" and reuse_existing_profile_tabs:
+                        # 旧监听状态存在时可能已经积累同账号重复页。每次只安全
+                        # 关闭一个重复页并从搜一搜重新起步，避免关闭后相邻标签
+                        # 选择不确定而误伤主标签或其他账号。
+                        for _dedup_round in range(8):
+                            dedup_result = deduplicate_account_profile_tabs(
+                                profile_window, account
+                            )
+                            if not dedup_result.get("duplicates_closed"):
+                                break
+                    registry_item = {
+                        "status": "ready",
+                        "account": account,
+                        "observed_name": observed_name,
+                        "page_kind": profile_window.page_kind,
+                        "hwnd": profile_window.hwnd,
+                        "verified_at": datetime.now(timezone.utc).isoformat(),
+                        "bootstrap_attempt": attempt,
+                    }
+                    scheduler_state.setdefault("profile_registry", {})[account] = registry_item
+                    states[account]["profile"] = registry_item
+                    states[account]["last_error"] = None
+                    save_watch_state(account_dir / "watch-state.json", states[account])
+                    save_watch_state(scheduler_path, scheduler_state)
+                    log_event(
+                        "watch_profile_bootstrap_succeeded",
+                        account=account,
+                        observed_name=observed_name,
+                        page_kind=profile_window.page_kind,
+                        hwnd=profile_window.hwnd,
+                        attempt=attempt,
+                    )
+                    break
+                except Exception as exc:
+                    bootstrap_error = str(exc)
+                    log_event(
+                        "watch_profile_bootstrap_attempt_failed",
+                        account=account,
+                        attempt=attempt,
+                        error=bootstrap_error,
+                        category=classify_collection_error(exc),
+                    )
+                    time.sleep(0.8)
+            else:
+                registry_item = {
+                    "status": "temporarily_unverified",
+                    "account": account,
+                    "verified_at": None,
+                    "last_error": bootstrap_error,
+                }
+                scheduler_state.setdefault("profile_registry", {})[account] = registry_item
+                states[account]["profile"] = registry_item
+                states[account]["last_error"] = bootstrap_error
+                states[account]["consecutive_failures"] = int(
+                    states[account].get("consecutive_failures") or 0
+                ) + 1
+                save_watch_state(account_dir / "watch-state.json", states[account])
+                save_watch_state(scheduler_path, scheduler_state)
+                log_event(
+                    "watch_profile_bootstrap_failed",
+                    account=account,
+                    error=bootstrap_error,
+                    category=classify_collection_error(RuntimeError(bootstrap_error)),
+                    action="defer_without_declaring_profile_absent",
+                )
+
+        scheduler_state["phase"] = "poll_profiles"
+        scheduler_state["bootstrap_finished_at"] = datetime.now(timezone.utc).isoformat()
+        scheduler_state["profiles_ready"] = [
+            account
+            for account in accounts
+            if account in _WATCH_PROFILE_CACHE
+        ]
+        scheduler_state["profiles_unavailable"] = [
+            account
+            for account in accounts
+            if account not in _WATCH_PROFILE_CACHE
+        ]
+        save_watch_state(scheduler_path, scheduler_state)
+        profiles_bootstrapped = True
+        log_event(
+            "watch_profile_bootstrap_finished",
+            profiles_ready=scheduler_state["profiles_ready"],
+            profiles_unavailable=scheduler_state["profiles_unavailable"],
+            action="start_serial_profile_polling",
+        )
+
     try:
         while watch_cycles == 0 or completed_rounds < watch_cycles:
             if schedule_start_minutes is not None and schedule_end_minutes is not None:
@@ -2730,6 +3240,13 @@ def watch_multiple_accounts(
                         window_end=window_end.isoformat(),
                     )
 
+            if not profiles_bootstrapped:
+                bootstrap_profiles(
+                    "schedule_window_opened"
+                    if schedule_start_minutes is not None
+                    else "listener_start"
+                )
+
             if not pending:
                 completed_rounds += 1
                 scheduler_state["round_count"] = completed_rounds
@@ -2737,7 +3254,7 @@ def watch_multiple_accounts(
                 save_watch_state(scheduler_path, scheduler_state)
                 if watch_cycles and completed_rounds >= watch_cycles:
                     break
-                pending = set(accounts)
+                pending = list(accounts)
                 due_at = datetime.now(timezone.utc) + timedelta(seconds=poll_interval_seconds)
                 next_due = {account: due_at for account in accounts}
 
@@ -2749,7 +3266,10 @@ def watch_multiple_accounts(
                 _sleep_in_chunks(min(30.0, max(1.0, wait_seconds)))
                 continue
 
-            account = min(ready, key=lambda item: next_due[item])
+            account = min(
+                ready,
+                key=lambda item: (next_due[item], account_order[item]),
+            )
             state = states[account]
             state["cycle_count"] = max(0, int(state.get("cycle_count") or 0)) + 1
             cycle_number = state["cycle_count"]
@@ -2806,6 +3326,20 @@ def watch_multiple_accounts(
                     "failures": len(summary.get("failures") or []),
                 }
                 state["consecutive_failures"] = 0
+                cached_profile = _WATCH_PROFILE_CACHE.get(account)
+                if cached_profile is not None:
+                    registry_item = scheduler_state.setdefault("profile_registry", {}).get(account, {})
+                    registry_item.update(
+                        {
+                            "status": "ready",
+                            "account": account,
+                            "page_kind": cached_profile.page_kind,
+                            "hwnd": cached_profile.hwnd,
+                            "last_ready_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                    )
+                    scheduler_state["profile_registry"][account] = registry_item
+                    state["profile"] = registry_item
                 log_event(
                     "watch_account_cycle_finished",
                     account=account,
@@ -2817,7 +3351,23 @@ def watch_multiple_accounts(
                     stop_reason=summary.get("stop_reason"),
                 )
             except Exception as exc:
-                _WATCH_PROFILE_CACHE.pop(account, None)
+                scan_state = _WATCH_PROFILE_SCAN_STATE.get(account, {})
+                completed_cycle = bool(scan_state.get("completed_cycle"))
+                temporary = isinstance(exc, ProfileTemporarilyUnverifiedError) or not completed_cycle
+                if not temporary:
+                    _WATCH_PROFILE_CACHE.pop(account, None)
+                registry_item = scheduler_state.setdefault("profile_registry", {}).get(account, {})
+                registry_item.update(
+                    {
+                        "status": (
+                            "temporarily_unverified" if temporary else "rebuild_required"
+                        ),
+                        "last_error": str(exc),
+                        "last_failed_at": datetime.now(timezone.utc).isoformat(),
+                        "last_scan_state": scan_state,
+                    }
+                )
+                scheduler_state["profile_registry"][account] = registry_item
                 state["last_error"] = str(exc)
                 state["consecutive_failures"] = int(state.get("consecutive_failures") or 0) + 1
                 log_event(
@@ -2826,9 +3376,22 @@ def watch_multiple_accounts(
                     cycle=cycle_number,
                     error=str(exc),
                     category=classify_collection_error(exc),
+                    profile_status=registry_item["status"],
+                    action=(
+                        "retry_later_without_rebuild"
+                        if temporary
+                        else "allow_account_scoped_rebuild"
+                    ),
                 )
             state["last_cycle_finished_at"] = datetime.now(timezone.utc).isoformat()
             save_watch_state(account_dir / "watch-state.json", state)
+            scheduler_state["profiles_ready"] = [
+                item for item in accounts if item in _WATCH_PROFILE_CACHE
+            ]
+            scheduler_state["profiles_unavailable"] = [
+                item for item in accounts if item not in _WATCH_PROFILE_CACHE
+            ]
+            save_watch_state(scheduler_path, scheduler_state)
             pending.remove(account)
             next_due[account] = datetime.now(timezone.utc) + timedelta(seconds=poll_interval_seconds)
     except KeyboardInterrupt:
@@ -2871,7 +3434,12 @@ def classify_collection_error(error: BaseException) -> str:
         return "account_not_found"
     if "筛选未确认选中" in text or "二级公众号筛选" in text:
         return "account_filter"
-    if "资料窗口顶部名称不匹配" in text:
+    if (
+        "资料窗口顶部名称不匹配" in text
+        or "资料页整屏未找到名称匹配" in text
+        or "缺少公众号资料页结构证据" in text
+        or "当前仍是搜一搜页面" in text
+    ):
         return "profile_validation"
     if "ocr" in text or "识别" in text or "模板" in text:
         return "interaction_ocr"
@@ -3306,6 +3874,125 @@ def wait_for_search_account_tab(
     )
 
 
+def settle_search_result_after_submit(
+    search_window: WindowInfo,
+    output_dir: Path,
+    account_name: str,
+    submit_attempt: int,
+    *,
+    timeout_seconds: float = 6.0,
+) -> Image.Image:
+    """等待结果页布局稳定，关闭并验证提交后重新出现的联想层。
+
+    这里仅使用 OpenCV 状态检查，不运行整屏 OCR。只有结果页顶部搜索栏已经出现、
+    且输入框连续两次处于失焦状态，调用方才可以开始公众号结果 OCR。
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout_seconds
+    transition_probe = 0
+    last_state: dict[str, Any] = {
+        "found": False,
+        "result_layout_ready": False,
+        "input_focused": False,
+        "reason": "尚未检查提交后的搜索页面",
+    }
+    result_image: Image.Image | None = None
+    while time.monotonic() < deadline:
+        transition_probe += 1
+        activate_window(search_window.hwnd)
+        result_image = capture_window(search_window.rect)
+        last_state = PROFILE_OCR.inspect_search_submit_state(result_image)
+        if last_state.get("result_layout_ready"):
+            result_image.save(
+                output_dir
+                / f"search-after-submit-before-escape-{submit_attempt}.png"
+            )
+            log_event(
+                "search_result_layout_ready",
+                account=account_name,
+                attempt=submit_attempt,
+                transition_probes=transition_probe,
+                state=last_state,
+            )
+            break
+        time.sleep(0.20)
+    else:
+        if result_image is not None:
+            result_image.save(
+                output_dir / f"search-submit-layout-timeout-{submit_attempt}.png"
+            )
+        raise RuntimeError(
+            "提交搜索后未进入顶部结果页布局："
+            + str(last_state.get("reason") or last_state)
+        )
+
+    assert result_image is not None
+    for dismiss_attempt in range(1, 4):
+        state = PROFILE_OCR.inspect_search_submit_state(result_image)
+        if state.get("input_focused"):
+            log_event(
+                "search_suggestion_dismiss_requested",
+                account=account_name,
+                attempt=submit_attempt,
+                dismiss_attempt=dismiss_attempt,
+                method="escape_after_result_layout_ready",
+                state=state,
+            )
+            press_escape()
+            time.sleep(0.20)
+            result_image = capture_window(search_window.rect)
+            state = PROFILE_OCR.inspect_search_submit_state(result_image)
+            if state.get("input_focused"):
+                # Escape 可能只关闭刚完成导航的旧层。点击网页顶部右侧安全空白区
+                # 释放搜索框焦点，不点击搜索结果、账号卡片或浏览器标题栏。
+                click(
+                    search_window.rect.left + round(search_window.rect.width * 0.92),
+                    search_window.rect.top + round(search_window.rect.height * 0.20),
+                )
+                log_event(
+                    "search_suggestion_neutral_blur_requested",
+                    account=account_name,
+                    attempt=submit_attempt,
+                    dismiss_attempt=dismiss_attempt,
+                    method="safe_page_blank_click",
+                )
+
+        # 给结果页自动聚焦逻辑留出时间；必须连续两次确认失焦，不能发送按键后
+        # 立刻把“请求关闭”误记成“已经关闭”。
+        time.sleep(0.45)
+        first_verify = capture_window(search_window.rect)
+        first_state = PROFILE_OCR.inspect_search_submit_state(first_verify)
+        if first_state.get("input_focused"):
+            result_image = first_verify
+            continue
+        time.sleep(0.35)
+        second_verify = capture_window(search_window.rect)
+        second_state = PROFILE_OCR.inspect_search_submit_state(second_verify)
+        if second_state.get("input_focused"):
+            result_image = second_verify
+            continue
+
+        second_verify.save(output_dir / f"search-after-submit-{submit_attempt}.png")
+        second_verify.save(output_dir / "search-after-submit.png")
+        log_event(
+            "search_suggestion_dismiss_confirmed",
+            account=account_name,
+            attempt=submit_attempt,
+            dismiss_attempt=dismiss_attempt,
+            state=second_state,
+        )
+        return second_verify
+
+    result_image.save(output_dir / f"search-suggestion-dismiss-failed-{submit_attempt}.png")
+    log_event(
+        "search_suggestion_dismiss_failed",
+        account=account_name,
+        attempt=submit_attempt,
+        state=PROFILE_OCR.inspect_search_submit_state(result_image),
+    )
+    raise RuntimeError("搜索结果页联想下拉层连续关闭失败")
+
+
 def search_and_open_profile(
     account_name: str,
     output_dir: Path,
@@ -3316,13 +4003,9 @@ def search_and_open_profile(
 ) -> tuple[WindowInfo, str]:
     """通过搜一搜精确名称打开公众号资料窗口，不要求当前微信账号关注公众号。"""
     global _SEARCH_WINDOW_HOT
+    # 搜索页激活后，上一条资料页相对路由不再可信。成功打开资料页时重新登记。
+    mark_watch_profile_active(None)
     search_name = resolve_search_account_name(account_name)
-    log_event(
-        "account_search_started",
-        account=account_name,
-        search_name=search_name,
-        alias_applied=search_name != account_name,
-    )
     try:
         search_window = find_sogou_search_window()
     except RuntimeError as exc:
@@ -3342,9 +4025,41 @@ def search_and_open_profile(
         )
     search_window = arrange_automation_window(search_window, "browser")
     activate_window(search_window.hwnd)
+    # 恢复搜索前先检查当前标签是否已经是目标资料页。轮询阶段经常只是资料页
+    # 被滚动或短暂加载，不能先报“没有搜索框”再无谓重建同账号标签。
+    current_image, current_profile_validation = validate_profile_with_home_recovery(
+        search_window, search_name
+    )
+    if current_profile_validation.get("matched"):
+        profile_window = WindowInfo(
+            search_window.hwnd,
+            search_window.title,
+            search_window.class_name,
+            search_window.rect,
+            search_window.process_name,
+            "embedded_profile_tab",
+        )
+        _WATCH_PROFILE_CACHE[account_name] = profile_window
+        mark_watch_profile_active(account_name)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        current_image.save(output_dir / "profile-recovered-before-search.png")
+        log_event(
+            "search_recovery_target_profile_reused",
+            account=account_name,
+            validation=current_profile_validation,
+            action="cancel_search_rebuild",
+        )
+        return profile_window, account_name
     # 不再假设搜一搜位于首标签，也不发送标签移动快捷键。Win11 微信中资料页、
     # 文章页和搜一搜可能共存于同一窗口，后续通过页面 OCR 扫描并停留在正确标签。
     output_dir.mkdir(parents=True, exist_ok=True)
+    log_event(
+        "account_search_started",
+        account=account_name,
+        search_name=search_name,
+        alias_applied=search_name != account_name,
+        reason="direct_search",
+    )
     search_box: dict[str, Any] = {"found": False}
     before: Image.Image | None = None
     search_page_recreated = False
@@ -3375,6 +4090,15 @@ def search_and_open_profile(
                 )
                 search_tab_is_current = True
                 continue
+            recovered_profile = _SEARCH_SCAN_RECOVERED_PROFILE.pop(account_name, None)
+            if recovered_profile is not None:
+                recovered_profile = arrange_automation_window(recovered_profile, "profile")
+                log_event(
+                    "search_recovery_cancelled_by_target_profile",
+                    account=account_name,
+                    hwnd=recovered_profile.hwnd,
+                )
+                return recovered_profile, account_name
             # 所有现有标签都不是搜一搜，才从微信主窗口重建，避免无谓关闭整个浏览器。
             search_window = recreate_sogou_search_window(
                 search_window,
@@ -3441,11 +4165,9 @@ def search_and_open_profile(
         press_ctrl_a()
         set_clipboard_text(search_name)
         press_ctrl_v()
-        # 输入后会先出现联想下拉框。Escape 只关闭联想，不改变输入内容，
-        # 再提交可避免 OCR 把联想项误当成搜索结果。
-        time.sleep(0.12)
-        press_escape()
-        time.sleep(0.08)
+        # Win11 新版搜一搜是在提交后切换布局，并可能在结果页再次自动聚焦。
+        # 提交函数不直接发送 Escape；后续状态机会等待结果布局并验证焦点释放。
+        time.sleep(0.20)
         button_x = search_window.rect.left + round(
             search_window.rect.width * int(current_box["button_x_1000"]) / 1000
         )
@@ -3454,23 +4176,24 @@ def search_and_open_profile(
         )
         if submit_attempt == 2:
             press_enter()
-            submit_method = "escape-enter"
+            submit_method = "enter"
         else:
             click(button_x, button_y)
-            submit_method = "escape-search-button"
-        time.sleep(0.08)
-        after_submit = capture_window(search_window.rect)
-        after_submit.save(output_dir / f"search-after-submit-{submit_attempt}.png")
-        after_submit.save(output_dir / "search-after-submit.png")
+            submit_method = "search-button"
         log_event(
             "search_submitted",
             account=account_name,
             search_name=search_name,
             attempt=submit_attempt,
             method=submit_method,
-            snapshot_path=str(output_dir / "search-after-submit.png"),
         )
         try:
+            settle_search_result_after_submit(
+                search_window,
+                output_dir,
+                account_name,
+                submit_attempt,
+            )
             account_tab, screenshot = wait_for_search_account_tab(
                 search_window,
                 output_dir / f"submit-attempt-{submit_attempt}",
@@ -3788,6 +4511,9 @@ def search_and_open_profile(
         reason=target.get("reason"),
         matched_name=target.get("matched_name") or target.get("name"),
         name_match_method=target.get("name_match_method"),
+        account_type=target.get("account_type"),
+        candidate_types=target.get("candidate_types"),
+        selection_policy=target.get("selection_policy"),
     )
     (output_dir / "search-detection.json").write_text(
         json.dumps(target, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -3884,6 +4610,7 @@ def search_and_open_profile(
                 model_matched=vl_validation.get("matched"),
                 page_kind=candidate.page_kind,
             )
+            mark_watch_profile_active(account_name)
             return candidate, observed_name
         except Exception as exc:
             log_event(
@@ -3927,6 +4654,7 @@ def search_and_open_profile(
                 )
                 log_event("profile_opened_and_verified", account=account_name, validation=validation)
                 # 后续正文页严格校验微信实际展示的名称，避免“库内别名”导致误报。
+                mark_watch_profile_active(account_name)
                 return profile, str(target.get("matched_name") or target.get("name") or account_name)
             last_reason = str(validation.get("reason") or "资料窗口名称不匹配")
             layout_evidence = PROFILE_OCR.inspect_profile_layout(header_image)
@@ -3941,44 +4669,58 @@ def search_and_open_profile(
                 reason=last_reason,
             )
             header_image.save(output_dir / "profile-header-mismatch.png")
-            # 先用只读视觉复核处理本地 OCR 抖动，再决定是否重试点击。
+            # 当前标签校验失败时先完成本地标签扫描，之后才允许视觉模型复核。
             # 对内嵌资料页尤其重要：不能在确认失败前调用 close_window，
             # 因为那会关闭整个 Chrome_WidgetWin_0，而不是当前资料标签。
             if time.time() >= avatar_retry_at:
+                if profile.page_kind == "embedded_profile_tab" and activate_embedded_profile_tab(
+                    profile,
+                    search_name,
+                    max_tabs=WIN11_MAX_TAB_SCAN,
+                ):
+                    recovered_profile = arrange_automation_window(profile, "profile")
+                    log_event(
+                        "profile_tab_recovered",
+                        account=account_name,
+                        method="content-scan-before-vl",
+                    )
+                    mark_watch_profile_active(account_name)
+                    return recovered_profile, search_name
+                header_image = capture_window(profile.rect)
                 confirmed = try_qwen_profile_confirmation(
                     header_image, profile, last_reason
                 )
                 if confirmed is not None:
+                    mark_watch_profile_active(account_name)
                     return confirmed
             if not avatar_retry_done and time.time() >= avatar_retry_at:
-                # 名称区域在部分微信版本中只会选中文字，未必打开资料页。此时先关闭
-                # 不匹配的旧资料窗口，再点击同一卡片头像，确保下一次校验对应本次账号。
-                try:
-                    if profile.page_kind == "embedded_profile_tab":
-                        activate_window(profile.hwnd)
-                        press_ctrl_w()
-                        time.sleep(0.12)
-                        log_event(
-                            "profile_tab_closed_for_retry",
-                            account=account_name,
-                            method="ctrl-w-active-profile-tab",
-                        )
-                    else:
-                        close_window(profile.hwnd)
-                except Exception:
-                    pass
+                # 当前页不匹配不能证明它可以安全关闭；它可能是其他九个账号或
+                # 未知页面。保留现场，找到已确认的搜一搜工作面后再重试头像。
                 activate_window(search_window.hwnd)
-                # 资料页是新标签时，Ctrl+W 后应落回搜索页；再次确认后才允许
-                # 使用搜索结果卡片坐标，避免把头像坐标点到资料页正文上。
+                # 再次确认搜一搜工作面后才允许使用结果卡片坐标，避免把头像
+                # 坐标点到其他账号资料页或未知页面上。
                 search_page = _inspect_sogou_search_results(
                     capture_window(search_window.rect)
                 )
                 if not search_page.get("found"):
                     activate_window(search_window.hwnd)
-                    if find_and_pin_search_tab(search_window, account_name, max_tabs=12):
+                    if find_and_pin_search_tab(
+                        search_window,
+                        account_name,
+                        max_tabs=WIN11_MAX_TAB_SCAN,
+                    ):
                         search_page = _inspect_sogou_search_results(
                             capture_window(search_window.rect)
                         )
+                    else:
+                        recovered_profile = _SEARCH_SCAN_RECOVERED_PROFILE.pop(
+                            account_name, None
+                        )
+                        if recovered_profile is not None:
+                            recovered_profile = arrange_automation_window(
+                                recovered_profile, "profile"
+                            )
+                            return recovered_profile, account_name
                 if not search_page.get("found"):
                     raise RuntimeError("资料页重试前无法安全回到搜一搜结果页")
                 avatar_x = search_window.rect.left + round(
@@ -4001,8 +4743,8 @@ def search_and_open_profile(
             last_reason = str(exc)
             if not avatar_retry_done and time.time() >= avatar_retry_at:
                 # 资料页可能是搜一搜浏览器中的新标签，顶层窗口标题和窗口枚举
-                # 都无法区分它；先对当前活动标签做一次只读视觉复核。
-                current_image = capture_window(search_window.rect)
+                # 都无法区分它；先扫描全部本地标签，只有本地路径穷尽后才请求
+                # Qwen-VL，避免资料页已经打开时仍等待不可用的模型接口。
                 embedded_profile = WindowInfo(
                     search_window.hwnd,
                     search_window.title,
@@ -4011,17 +4753,14 @@ def search_and_open_profile(
                     search_window.process_name,
                     "embedded_profile_tab",
                 )
-                confirmed = try_qwen_profile_confirmation(
-                    current_image, embedded_profile, last_reason
-                )
-                if confirmed is not None:
-                    return confirmed
                 # 点击结果后，资料页可能在同一个 Chromium 窗口的新标签中打开，
                 # 但并未成为当前活动标签。先扫描所有标签找资料页，再决定是否
                 # 回到搜一搜结果页重试，避免把真实资料页误当成未知旧标签。
                 try:
                     if activate_embedded_profile_tab(
-                        search_window, search_name, max_tabs=12
+                        search_window,
+                        search_name,
+                        max_tabs=WIN11_MAX_TAB_SCAN,
                     ):
                         recovered_profile = WindowInfo(
                             search_window.hwnd,
@@ -4039,6 +4778,7 @@ def search_and_open_profile(
                             account=account_name,
                             method="content-scan-after-click",
                         )
+                        mark_watch_profile_active(account_name)
                         return recovered_profile, search_name
                 except Exception as scan_exc:
                     log_event(
@@ -4046,6 +4786,13 @@ def search_and_open_profile(
                         account=account_name,
                         error=str(scan_exc),
                     )
+                current_image = capture_window(search_window.rect)
+                confirmed = try_qwen_profile_confirmation(
+                    current_image, embedded_profile, last_reason
+                )
+                if confirmed is not None:
+                    mark_watch_profile_active(account_name)
+                    return confirmed
                 # 某些版本只有头像或整张卡片响应点击，名称链接本身可能不触发资料窗口。
                 activate_window(search_window.hwnd)
                 search_page = _inspect_sogou_search_results(
@@ -4053,10 +4800,23 @@ def search_and_open_profile(
                 )
                 if not search_page.get("found"):
                     activate_window(search_window.hwnd)
-                    if find_and_pin_search_tab(search_window, account_name, max_tabs=12):
+                    if find_and_pin_search_tab(
+                        search_window,
+                        account_name,
+                        max_tabs=WIN11_MAX_TAB_SCAN,
+                    ):
                         search_page = _inspect_sogou_search_results(
                             capture_window(search_window.rect)
                         )
+                    else:
+                        recovered_profile = _SEARCH_SCAN_RECOVERED_PROFILE.pop(
+                            account_name, None
+                        )
+                        if recovered_profile is not None:
+                            recovered_profile = arrange_automation_window(
+                                recovered_profile, "profile"
+                            )
+                            return recovered_profile, account_name
                 if not search_page.get("found"):
                     raise RuntimeError("资料页重试前无法安全回到搜一搜结果页")
                 avatar_x = search_window.rect.left + round(
@@ -4085,6 +4845,7 @@ def analyze_profile_window(
     expected_name: str | None = None,
     client: QwenVisionClient | None = None,
     allow_vl: bool = True,
+    scan_range: str = "today_yesterday",
 ) -> dict[str, Any]:
     """分析公众号资料页中的时间分组和文章卡片。
 
@@ -4138,11 +4899,35 @@ def analyze_profile_window(
         try:
             candidate = PROFILE_OCR.inspect_profile_feed(screenshot)
             candidate = safe_article_candidates(candidate)
-            if not candidate.get("time_labels") or not candidate.get("articles"):
+            time_labels = candidate.get("time_labels") or []
+            articles = candidate.get("articles") or []
+            terminal_empty_labels = [
+                str(item.get("text") or "")
+                for item in time_labels
+                if is_older_time_boundary(str(item.get("text") or ""))
+                or (
+                    scan_range == "today"
+                    and "昨天" in str(item.get("text") or "")
+                )
+            ]
+            if time_labels and not articles and terminal_empty_labels:
+                candidate["empty_feed_reason"] = "outside_scan_range_boundary"
+                candidate["empty_feed_labels"] = terminal_empty_labels
+                feed = candidate
+                log_event(
+                    "profile_feed_local_empty_range",
+                    hwnd=profile_window.hwnd,
+                    attempt=local_attempt,
+                    scan_range=scan_range,
+                    time_labels=[str(item.get("text") or "") for item in time_labels],
+                    reason="页面只有扫描范围外的日期分组",
+                )
+                break
+            if not time_labels or not articles:
                 raise ValueError(
                     "本地资料页识别结果不完整："
-                    f"time_labels={len(candidate.get('time_labels', []))}，"
-                    f"articles={len(candidate.get('articles', []))}"
+                    f"time_labels={len(time_labels)}，"
+                    f"articles={len(articles)}"
                 )
             # “阅读/赞”只用于补充列表互动数，不再作为文章点击的硬门槛。
             # Win11 资料页有时能读到标题和日期，但互动栏被图片、懒加载或布局遮挡；
@@ -4667,6 +5452,7 @@ def collect_profile_account(
     )
     stop_reason = "达到最大翻页数"
     partial_summary_path = output_dir / "partial-summary.json"
+    rebuild_lock_acquired = False
 
     def write_partial_checkpoint() -> None:
         """逐篇保存账号进度，避免后续窗口清理失败掩盖已成功结果。"""
@@ -4714,7 +5500,29 @@ def collect_profile_account(
                     account_name,
                     output_dir=output_dir / "profile" / "refresh",
                 ):
-                    raise RuntimeError("缓存资料页刷新后未恢复目标账号")
+                    # 刷新超时不等于标签已消失。微信内嵌页偶尔在 12 秒后才
+                    # 恢复，或刷新后把焦点切到相邻标签；先穷尽本地标签恢复，
+                    # 只有确实找不到目标资料页时才回退搜一搜。
+                    recovered_locally = (
+                        profile_window.page_kind == "embedded_profile_tab"
+                        and activate_embedded_profile_tab(
+                            profile_window,
+                            account_name,
+                            max_tabs=WIN11_MAX_TAB_SCAN,
+                        )
+                    )
+                    if not recovered_locally:
+                        raise RuntimeError("缓存资料页刷新后本地扫描仍未恢复目标账号")
+                    recovery_validation = PROFILE_OCR.validate_profile_header(
+                        capture_window(profile_window.rect), account_name
+                    )
+                    if not recovery_validation.get("matched"):
+                        raise RuntimeError("缓存资料页刷新后本地恢复身份校验失败")
+                    log_event(
+                        "profile_refresh_recovered_by_local_scan",
+                        account=account_name,
+                        validation=recovery_validation,
+                    )
                 validation = PROFILE_OCR.validate_profile_header(
                     capture_window(profile_window.rect), account_name
                 )
@@ -4728,33 +5536,77 @@ def collect_profile_account(
                     validation=validation,
                 )
             except Exception as exc:
+                scan_state = _WATCH_PROFILE_SCAN_STATE.get(account_name, {})
                 log_event(
                     "profile_tab_reuse_failed",
                     account=account_name,
                     error=str(exc),
-                    action="fallback_to_search",
+                    scan_state=scan_state,
+                    action=(
+                        "fallback_to_search_after_complete_cycle"
+                        if scan_state.get("completed_cycle")
+                        else "defer_without_rebuild"
+                    ),
                 )
+                if preserve_profile and not scan_state.get("completed_cycle"):
+                    raise ProfileTemporarilyUnverifiedError(
+                        "资料页暂时无法确认，尚未可靠完成标签整圈扫描，已禁止重新搜索"
+                    ) from exc
                 profile_window = None
                 _WATCH_PROFILE_CACHE.pop(account_name, None)
         if profile_window is None:
-            search_error = ""
-            for attempt in range(1, 4):
-                try:
-                    log_event("account_search_attempt", account=account_name, attempt=attempt)
-                    profile_window, observed_account_name = search_and_open_profile(
-                        account_name,
-                        output_dir / "search" / f"attempt-{attempt}",
-                        client=client,
-                        allow_vl=allow_vl,
-                        manual_fallback_seconds=manual_search_fallback_seconds,
+            if preserve_profile and reuse_profile_window is not None:
+                if account_name in _WATCH_PROFILE_REBUILD_LOCKS:
+                    raise ProfileTemporarilyUnverifiedError(
+                        f"账号 {account_name} 已有重建任务运行，本轮稍后重试"
                     )
-                    break
-                except Exception as exc:
-                    search_error = str(exc)
-                    log_event("account_search_attempt_failed", account=account_name, attempt=attempt, error=search_error)
-                    time.sleep(0.8)
-            if profile_window is None:
-                raise RuntimeError(f"搜一搜连续3次打开公众号失败：{search_error}")
+                _WATCH_PROFILE_REBUILD_LOCKS.add(account_name)
+                rebuild_lock_acquired = True
+                # 获得重建锁后必须再次扫描现有标签；此处找到目标就取消新建。
+                if activate_embedded_profile_tab(
+                    reuse_profile_window,
+                    account_name,
+                    max_tabs=WIN11_MAX_TAB_SCAN,
+                ):
+                    profile_window = reuse_profile_window
+                    _WATCH_PROFILE_CACHE[account_name] = profile_window
+                    log_event(
+                        "profile_rebuild_cancelled_existing_tab_found",
+                        account=account_name,
+                    )
+                else:
+                    final_scan_state = _WATCH_PROFILE_SCAN_STATE.get(account_name, {})
+                    if not final_scan_state.get("completed_cycle"):
+                        raise ProfileTemporarilyUnverifiedError(
+                            "重建前复扫未能证明已完整绕行一圈，已取消重新搜索"
+                        )
+            if profile_window is not None:
+                log_event(
+                    "profile_tab_reused",
+                    account=account_name,
+                    page_kind=profile_window.page_kind,
+                    refreshed=False,
+                    validation={"matched": True, "method": "pre-rebuild-rescan"},
+                )
+            else:
+                search_error = ""
+                for attempt in range(1, 4):
+                    try:
+                        log_event("account_search_attempt", account=account_name, attempt=attempt)
+                        profile_window, observed_account_name = search_and_open_profile(
+                            account_name,
+                            output_dir / "search" / f"attempt-{attempt}",
+                            client=client,
+                            allow_vl=allow_vl,
+                            manual_fallback_seconds=manual_search_fallback_seconds,
+                        )
+                        break
+                    except Exception as exc:
+                        search_error = str(exc)
+                        log_event("account_search_attempt_failed", account=account_name, attempt=attempt, error=search_error)
+                        time.sleep(0.8)
+                if profile_window is None:
+                    raise RuntimeError(f"搜一搜连续3次打开公众号失败：{search_error}")
         if preserve_profile and profile_window is not None:
             _WATCH_PROFILE_CACHE[account_name] = profile_window
         # 记录 OCR 看到的结果名，但后续文章归属仍使用 account_name。
@@ -4778,6 +5630,7 @@ def collect_profile_account(
                 expected_name=account_name,
                 client=client,
                 allow_vl=allow_vl,
+                scan_range=scan_range,
             )
             log_event(
                 "profile_page_analyzed",
@@ -5045,16 +5898,45 @@ def collect_profile_account(
             # 下一屏由 OCR 结果决定是否继续；只留短暂的懒加载缓冲。
             time.sleep(0.4)
     finally:
+        if rebuild_lock_acquired:
+            _WATCH_PROFILE_REBUILD_LOCKS.discard(account_name)
         cleanup_succeeded = False
+        preserve_failure: str | None = None
         if preserve_profile and profile_window and user32.IsWindow(profile_window.hwnd):
-            cleanup_succeeded = True
-            _WATCH_PROFILE_CACHE[account_name] = profile_window
-            log_event(
-                "profile_tab_preserved",
-                account=account_name,
-                page_kind=profile_window.page_kind,
-                reason="multi_account_watch_cache",
-            )
+            try:
+                if profile_window.page_kind == "embedded_profile_tab" and not activate_embedded_profile_tab(
+                    profile_window, account_name, max_tabs=WIN11_MAX_TAB_SCAN
+                ):
+                    raise ProfileTemporarilyUnverifiedError(
+                        "轮询结束时无法重新定位本账号资料页"
+                    )
+                activate_window(profile_window.hwnd)
+                press_ctrl_home()
+                _home_image = wait_for_stable_frames(profile_window.rect)
+                home_validation = PROFILE_OCR.validate_profile_header(
+                    _home_image, account_name
+                )
+                if not home_validation.get("matched"):
+                    raise ProfileTemporarilyUnverifiedError(
+                        "轮询结束归位后账号资料页身份未通过精确校验"
+                    )
+                cleanup_succeeded = True
+                _WATCH_PROFILE_CACHE[account_name] = profile_window
+                log_event(
+                    "profile_tab_preserved",
+                    account=account_name,
+                    page_kind=profile_window.page_kind,
+                    reason="multi_account_watch_cache_after_ctrl_home",
+                    validation=home_validation,
+                )
+            except Exception as preserve_exc:
+                preserve_failure = str(preserve_exc)
+                log_event(
+                    "profile_tab_preserve_temporarily_unverified",
+                    account=account_name,
+                    error=preserve_failure,
+                    action="preserve_tab_and_retry_later_without_rebuild",
+                )
         elif profile_window and user32.IsWindow(profile_window.hwnd):
             if profile_window.page_kind == "embedded_profile_tab":
                 # 资料页是搜一搜浏览器中的活动标签，只能关闭当前标签，不能关闭
@@ -5088,6 +5970,8 @@ def collect_profile_account(
                 else "profile_cleanup_not_confirmed"
             ),
         )
+        if preserve_failure is not None:
+            raise ProfileTemporarilyUnverifiedError(preserve_failure)
 
     summary = {
         "account": account_name,

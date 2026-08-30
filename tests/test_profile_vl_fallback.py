@@ -462,6 +462,37 @@ class ProfileVLFallbackTests(unittest.TestCase):
         self.assertIsNone(feed["articles"][0].get("list_read_count"))
         self.assertIsNone(feed["articles"][0].get("list_like_count"))
 
+    def test_profile_feed_with_only_older_labels_is_normal_empty_result(self) -> None:
+        """当天监听遇到历史日期且没有卡片时应正常结束，不能调用 Qwen。"""
+        client = Mock()
+        screenshot = Image.new("RGB", (800, 600), "white")
+        window = rpa.WindowInfo(1, "公众号", "test", rpa.Rect(100, 80, 900, 680))
+        local_feed = {
+            "time_labels": [
+                {"text": "星期四", "center_y_1000": 300},
+                {"text": "8月17日", "center_y_1000": 700},
+            ],
+            "articles": [],
+            "recognition_method": "rapidocr-profile-feed",
+        }
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(rpa, "activate_window"),
+            patch.object(rpa, "capture_window", return_value=screenshot),
+            patch.object(rpa.PROFILE_OCR, "inspect_profile_feed", return_value=local_feed),
+        ):
+            feed = rpa.analyze_profile_window(
+                window,
+                Path(directory),
+                client=client,
+                scan_range="today",
+            )
+
+        self.assertEqual(feed["articles"], [])
+        self.assertEqual(feed["empty_feed_reason"], "outside_scan_range_boundary")
+        client.inspect_profile_feed.assert_not_called()
+
     def test_profile_feed_calls_qwen_once_after_two_local_failures(self) -> None:
         """本地连续两次缺少分组或卡片后，才调用一次 Qwen-VL 复核。"""
         client = Mock()

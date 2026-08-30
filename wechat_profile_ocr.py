@@ -396,6 +396,77 @@ class WeChatProfileOCR:
             "method": "opencv-sogou-green-search-button",
         }
 
+    def inspect_search_submit_state(self, screenshot: Image.Image) -> dict[str, Any]:
+        """用 OpenCV 快速判断搜索结果布局和输入框焦点状态。
+
+        这个检查不调用 OCR。新版搜一搜提交后会先切换到顶部搜索栏布局，
+        随后可能再次自动聚焦输入框并弹出联想层。绿色搜索按钮用于定位，
+        按钮左侧是否仍存在绿色输入框描边用于判断焦点是否已经释放。
+        """
+        rgb = np.asarray(screenshot.convert("RGB"))
+        height, width = rgb.shape[:2]
+        red = rgb[:, :, 0].astype(np.int16)
+        green = rgb[:, :, 1].astype(np.int16)
+        blue = rgb[:, :, 2].astype(np.int16)
+        green_mask = (
+            (green > 120)
+            & (green > red * 1.18)
+            & (green > blue * 1.08)
+        ).astype(np.uint8) * 255
+        # 先腐蚀掉输入框的一像素/三像素描边，避免描边与按钮偶然连通后形成
+        # 一个低填充率大组件，导致真正的实心搜索按钮无法被定位。
+        filled_green_mask = cv2.erode(
+            green_mask,
+            np.ones((3, 3), dtype=np.uint8),
+            iterations=1,
+        )
+        component_count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            filled_green_mask, 8
+        )
+        button_candidates: list[tuple[int, int, int, int, int]] = []
+        for index in range(1, component_count):
+            left, top, box_width, box_height, area = [int(value) for value in stats[index]]
+            if left < width * 0.50 or top > height * 0.60:
+                continue
+            if box_width < width * 0.06 or box_height < height * 0.025:
+                continue
+            fill_ratio = area / max(box_width * box_height, 1)
+            if fill_ratio < 0.45:
+                continue
+            button_candidates.append((area, left, top, box_width, box_height))
+        if not button_candidates:
+            return {
+                "found": False,
+                "result_layout_ready": False,
+                "input_focused": False,
+                "reason": "未找到绿色搜索按钮",
+                "method": "opencv-search-submit-state",
+            }
+
+        _area, left, top, box_width, box_height = max(
+            button_candidates, key=lambda item: item[0]
+        )
+        center_y = top + box_height / 2
+        focus_left = max(0, round(width * 0.02))
+        focus_right = max(focus_left + 1, left - 4)
+        focus_top = max(0, top - round(box_height * 0.30))
+        focus_bottom = min(height, top + box_height + round(box_height * 0.30))
+        focus_crop = green_mask[focus_top:focus_bottom, focus_left:focus_right]
+        focus_green_pixels = int(np.count_nonzero(focus_crop))
+        # 聚焦描边横跨输入框，绿色像素数量远高于文字抗锯齿噪声。
+        focus_threshold = max(40, round((focus_right - focus_left) * 0.35))
+        input_focused = focus_green_pixels >= focus_threshold
+        return {
+            "found": True,
+            "result_layout_ready": center_y < height * 0.24,
+            "input_focused": input_focused,
+            "button_bbox": [left, top, left + box_width, top + box_height],
+            "button_center_y_1000": round(center_y * 1000 / max(height, 1)),
+            "focus_green_pixels": focus_green_pixels,
+            "focus_threshold": focus_threshold,
+            "method": "opencv-search-submit-state",
+        }
+
     def locate_search_home(self, screenshot: Image.Image) -> dict[str, Any]:
         """识别搜一搜首页，供关闭资料页后的标签恢复使用。"""
         width, height = screenshot.size
@@ -485,62 +556,147 @@ class WeChatProfileOCR:
             and row["left"] < width * 0.55
             and _account_name_match(expected_name, row["text"])[0]
         ]
-        matches = exact_matches or alias_matches
+        # 完全同名的视频号和带“媒体”等安全后缀的公众号可能同时存在。
+        # 不能用 ``exact_matches or alias_matches``，否则任意完全同名视频号都会
+        # 把真正的“公众号名 + 媒体”候选从集合中整体丢弃。
+        matches: list[dict[str, Any]] = []
+        seen_match_ids: set[int] = set()
+        for candidate in exact_matches + alias_matches:
+            candidate_id = id(candidate)
+            if candidate_id in seen_match_ids:
+                continue
+            seen_match_ids.add(candidate_id)
+            matches.append(candidate)
         if not matches:
             return {"found": False, "reason": "搜一搜结果中没有精确匹配名称"}
-        row = min(matches, key=lambda item: item["center_y"])
-        _, name_match_method = _account_name_match(expected_name, row["text"])
-        # 已由上一层“公众号”二级筛选限制结果范围。卡片本身有时显示“个人”
-        # （主体类型）而非“公众号”，因此仍需结合原创内容等卡片证据判断，不能
-        # 仅因“个人”二字拒绝一个已经处于公众号筛选结果内的账号。
-        nearby_rows = [
+        # 同名结果可能同时包含视频号、公众号和服务号。必须按每张卡片自己的
+        # 垂直边界提取类型，不能让上方视频号借用下方公众号的类型证据。
+        ordered_matches = sorted(matches, key=lambda item: item["center_y"])
+        candidate_records: list[dict[str, Any]] = []
+        for index, candidate_name in enumerate(ordered_matches):
+            next_top = (
+                ordered_matches[index + 1].get("top", ordered_matches[index + 1]["center_y"])
+                if index + 1 < len(ordered_matches)
+                else height
+            )
+            card_bottom = min(
+                candidate_name["bottom"] + height * 0.16,
+                float(next_top) - 2,
+            )
+            card_rows = [
+                item
+                for item in rows
+                if candidate_name["bottom"] <= item["center_y"] <= card_bottom
+                and abs(item["left"] - candidate_name["left"]) < width * 0.16
+                and item is not candidate_name
+            ]
+            def normalized_account_type(item: dict[str, Any]) -> str:
+                normalized = item["normalized"]
+                if normalized == "公众号":
+                    return "公众号"
+                if normalized == "服务号":
+                    return "服务号"
+                # 视频号类型后面常带蝴蝶结/无限符号等图标，OCR 可能合并成
+                # “视频号∞”。它仍必须被识别为视频号并明确排除。
+                if normalized.startswith("视频号"):
+                    return "视频号"
+                return ""
+
+            explicit_types = [
+                (item, normalized_account_type(item))
+                for item in card_rows
+                if normalized_account_type(item)
+            ]
+            nearest_type = min(
+                explicit_types,
+                key=lambda pair: pair[0]["center_y"],
+                default=None,
+            )
+            explicit_type = nearest_type[1] if nearest_type else ""
+            original_content_evidence = [
+                item["text"]
+                for item in card_rows
+                if "篇原创内容" in item["normalized"]
+            ]
+            # 旧版公众号筛选结果可能显示主体类型“个人”，此时“篇原创内容”仍可
+            # 作为公众号证据；但明确写着“视频号”的卡片永远不能降级接受。
+            account_type = explicit_type
+            if not account_type and original_content_evidence:
+                account_type = "公众号"
+            organization_identity_evidence = [
+                item["text"]
+                for item in card_rows
+                if any(
+                    marker in item["normalized"]
+                    for marker in {
+                        "公司", "集团", "报社", "中心", "委员会", "政府",
+                        "管理局", "商务局", "发改委", "协会", "学校", "大学", "研究院",
+                    }
+                )
+            ]
+            candidate_records.append(
+                {
+                    "row": candidate_name,
+                    "name_match_method": _account_name_match(
+                        expected_name, candidate_name["text"]
+                    )[1],
+                    "account_type": account_type,
+                    "explicit_type": explicit_type,
+                    "type_evidence": [nearest_type[0]["text"]] if nearest_type else [],
+                    "original_content_evidence": original_content_evidence,
+                    "organization_identity_evidence": organization_identity_evidence,
+                    "personal_evidence": [
+                        item["text"]
+                        for item in card_rows
+                        if item["normalized"] == "个人"
+                    ],
+                    "card_bottom": round(card_bottom, 1),
+                }
+            )
+
+        eligible_candidates = [
             item
-            for item in rows
-            if row["bottom"] <= item["center_y"] <= row["bottom"] + height * 0.20
-            and abs(item["left"] - row["left"]) < width * 0.12
-            and item["normalized"] != expected
+            for item in candidate_records
+            if item["account_type"] in {"公众号", "服务号"}
+            and item["explicit_type"] != "视频号"
         ]
-        official_type_evidence = [
-            item["text"]
-            for item in nearby_rows
-            if item["normalized"] == "公众号"
-        ]
-        original_content_evidence = [
-            item["text"]
-            for item in nearby_rows
-            if "篇原创内容" in item["normalized"]
-        ]
-        personal_evidence = [
-            item["text"] for item in nearby_rows if item["normalized"] == "个人"
-        ]
-        official_evidence = official_type_evidence + original_content_evidence
-        if not official_evidence:
+        if not eligible_candidates:
             return {
                 "found": False,
-                "reason": "同名搜索结果缺少公众号内容证据，拒绝点击可能的无关账号",
-                "official_evidence": official_evidence,
-                "original_content_evidence": original_content_evidence,
-                "personal_evidence": personal_evidence,
+                "reason": "同名结果中没有可确认的公众号或服务号，视频号不会被打开",
+                "candidate_types": [item["explicit_type"] for item in candidate_records],
             }
-
-        # 主体公司通常位于类型文字下一行，保存下来便于后续审计同名账号。
-        company = next(
-            (
-                item["text"]
-                for item in nearby_rows
-                if item["normalized"] != "公众号"
-                and "篇原创内容" not in item["normalized"]
+        # 固定业务优先级：同一次搜索先公众号；完全没有公众号候选时才服务号。
+        selected = min(
+            eligible_candidates,
+            key=lambda item: (
+                0 if item["account_type"] == "公众号" else 1,
+                0 if item["name_match_method"] == "exact" else 1,
+                item["row"]["center_y"],
             ),
-            "",
         )
+        row = selected["row"]
+        account_type = selected["account_type"]
+        _, name_match_method = _account_name_match(expected_name, row["text"])
+        original_content_evidence = selected["original_content_evidence"]
+        organization_identity_evidence = selected["organization_identity_evidence"]
+        official_evidence = selected["type_evidence"] + original_content_evidence
+        account_identity_evidence = official_evidence + organization_identity_evidence
+        company = organization_identity_evidence[0] if organization_identity_evidence else ""
         return {
             "found": True,
             "name": row["text"],
             "matched_name": row["text"],
             "name_match_method": name_match_method,
             "company": company,
+            "account_type": account_type,
             "official_evidence": official_evidence,
+            "organization_identity_evidence": organization_identity_evidence,
+            "account_identity_evidence": account_identity_evidence,
             "original_content_evidence": original_content_evidence,
+            "candidate_types": [item["explicit_type"] for item in candidate_records],
+            "selection_policy": "prefer-official-account-then-service-account-never-video-account",
+            "card_bottom": selected["card_bottom"],
             "is_official_account": True,
             "center_x_1000": round(row["center_x"] * 1000 / width),
             "center_y_1000": round(row["center_y"] * 1000 / height),
@@ -781,26 +937,107 @@ class WeChatProfileOCR:
         }
 
     def validate_profile_header(self, screenshot: Image.Image, expected_name: str) -> dict[str, Any]:
-        """校验公众号资料窗口顶部名称，避免同名候选或旧窗口串号。"""
+        """用整页 OCR 身份和资料页结构确认账号。
+
+        方法名为兼容既有调用方保留；顶部名称不再是唯一证据。搜索结果页和文章
+        正文也可能出现公众号名称，因此必须同时满足资料页结构，才能判定匹配。
+        """
         width, height = screenshot.size
+        rows = self._rows(screenshot)
         header_rows = [
             row
-            for row in self._rows(screenshot)
+            for row in rows
             # Win11 窗口移动、缩放和浏览器工具栏高度变化后，资料页名称可能
             # 落在原 65% 横向范围之外；扩大到左侧 85% 仍保留顶部区域约束。
             if row["center_y"] < height * 0.28 and row["center_x"] < width * 0.85
         ]
         matches = [
             row
-            for row in header_rows
+            for row in rows
+            if row["center_y"] > height * 0.055
+            and row["center_y"] < height * 0.72
+            and row["center_x"] < width * 0.90
             if _account_name_match(expected_name, row["text"])[0]
         ]
+        action_terms = sorted(
+            {
+                row["normalized"]
+                for row in rows
+                if row["normalized"] in {"关注", "私信"}
+                and row["center_y"] < height * 0.55
+            }
+        )
+        navigation_rows = [
+            row
+            for row in rows
+            if row["normalized"] in {"全部", "贴图", "文章", "视频号"}
+            and row["center_y"] < height * 0.60
+        ]
+        navigation_terms = sorted({row["normalized"] for row in navigation_rows})
+        aligned_navigation_count = max(
+            (
+                len(
+                    {
+                        candidate["normalized"]
+                        for candidate in navigation_rows
+                        if abs(candidate["center_y"] - anchor["center_y"])
+                        <= height * 0.035
+                    }
+                )
+                for anchor in navigation_rows
+            ),
+            default=0,
+        )
+        identity_terms = sorted(
+            {
+                row["normalized"]
+                for row in rows
+                if row["normalized"] in {"公众号", "服务号"}
+                and row["center_y"] < height * 0.60
+            }
+        )
+        search_page_evidence = sorted(
+            {
+                row["normalized"]
+                for row in rows
+                if row["center_y"] < height * 0.55
+                and (
+                    row["normalized"] == "搜索"
+                    or row["normalized"].endswith("-账号")
+                    or row["normalized"].endswith("—账号")
+                )
+            }
+        )
+        # Win11 公众号/服务号资料页在滚动、未关注以及不同账号类型下，可能不
+        # 展示“关注/私信/公众号/服务号”。稳定的页面类型证据是同一导航行中
+        # 出现至少两个内容标签；账号身份仍由下面的名称精确匹配单独确认。
+        structural_match = bool(
+            not search_page_evidence and aligned_navigation_count >= 2
+        )
         if not matches:
             return {
                 "matched": False,
-                "reason": "公众号资料窗口顶部名称不匹配",
+                "reason": "公众号资料页整屏未找到名称匹配",
                 # 记录实际读到的顶部候选，便于区分 OCR 偏差、旧窗口残留和误点。
                 "observed_header_candidates": [row["text"] for row in header_rows[:8]],
+                "structural_terms": action_terms + navigation_terms + identity_terms,
+                "profile_structure_found": structural_match,
+                "aligned_navigation_count": aligned_navigation_count,
+                "search_page_evidence": search_page_evidence,
+            }
+        if not structural_match:
+            return {
+                "matched": False,
+                "reason": (
+                    "找到账号名称但当前仍是搜一搜页面"
+                    if search_page_evidence
+                    else "找到账号名称但缺少公众号资料页结构证据"
+                ),
+                "name_candidates": [row["text"] for row in matches[:5]],
+                "structural_terms": action_terms + navigation_terms + identity_terms,
+                "profile_structure_found": structural_match,
+                "aligned_navigation_count": aligned_navigation_count,
+                "search_page_evidence": search_page_evidence,
             }
         row = min(matches, key=lambda item: item["center_y"])
         _, name_match_method = _account_name_match(expected_name, row["text"])
@@ -808,7 +1045,11 @@ class WeChatProfileOCR:
             "matched": True,
             "name": row["text"],
             "confidence": row["confidence"],
-            "method": f"rapidocr-profile-header-{name_match_method}",
+            "method": f"rapidocr-profile-viewport-{name_match_method}",
+            "structural_terms": action_terms + navigation_terms + identity_terms,
+            "profile_structure_found": True,
+            "aligned_navigation_count": aligned_navigation_count,
+            "search_page_evidence": search_page_evidence,
         }
 
     def inspect_profile_layout(self, screenshot: Image.Image) -> dict[str, Any]:
@@ -823,11 +1064,9 @@ class WeChatProfileOCR:
                 and row["center_y"] < height * 0.55
             }
         )
-        # 资料页至少应同时出现关注按钮和两个内容标签。这里只输出结构候选，
-        # 最终身份仍必须由公众号名称 OCR 或 Qwen-VL 精确确认。
-        found = "关注" in terms and len(
-            set(terms).intersection({"全部", "贴图", "文章", "视频号"})
-        ) >= 2
+        # 页面类型不依赖“关注/私信”等可选控件；至少两个内容导航项即可。
+        # 最终账号身份仍必须由名称精确匹配确认。
+        found = len(set(terms).intersection({"全部", "贴图", "文章", "视频号"})) >= 2
         return {
             "found": found,
             "terms": terms,
@@ -898,7 +1137,9 @@ class WeChatProfileOCR:
             # 资料页滚动后第一张卡片可能紧贴顶部，后续仍会通过时间分组约束是否采集。
             if not height * 0.08 <= row["center_y"] <= height * 0.97:
                 continue
-            if len(normalized) < 5:
+            # 短标题在有“阅读/赞”锚点时同样可能是真实文章，例如“图解政策”。
+            # 此处只排除单字符噪声；无指标锚点的自由文本回退仍保持 5 字门槛。
+            if len(normalized) < 2:
                 continue
             title_rows.append(row)
 
@@ -973,6 +1214,8 @@ class WeChatProfileOCR:
 
         groups: list[list[dict[str, Any]]] = []
         for row in title_rows:
+            if len(row["normalized"]) < 5:
+                continue
             if not groups:
                 groups.append([row])
                 continue

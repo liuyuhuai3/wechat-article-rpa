@@ -164,6 +164,11 @@ class BrowserTabCleanupTests(unittest.TestCase):
             patch.object(rpa, "capture_window", return_value=image),
             patch.object(rpa, "press_ctrl_tab") as next_tab,
             patch.object(rpa, "press_ctrl_shift_pageup") as move_left,
+            patch.object(
+                rpa.PROFILE_OCR,
+                "validate_profile_header",
+                return_value={"matched": False},
+            ),
             patch.object(rpa, "_inspect_sogou_search_results", side_effect=[missing, missing, found]),
             patch.object(rpa, "log_event"),
         ):

@@ -151,6 +151,212 @@ class AccountMatchingTests(unittest.TestCase):
         self.assertIn("公众号", result["official_evidence"])
         self.assertIn("378篇原创内容 34分钟前更新", result["original_content_evidence"])
 
+    def test_search_result_without_public_or_service_type_is_rejected(self) -> None:
+        """资料页可不显示类型，但搜索结果必须确认公众号或服务号。"""
+        ocr = WeChatProfileOCR.__new__(WeChatProfileOCR)
+
+        def row(text: str, left: float, center_y: float, width: float = 180) -> dict[str, object]:
+            return {
+                "text": text,
+                "normalized": "".join(text.split()),
+                "left": left,
+                "right": left + width,
+                "top": center_y - 15,
+                "bottom": center_y + 15,
+                "center_x": left + width / 2,
+                "center_y": center_y,
+                "confidence": 0.99,
+            }
+
+        ocr._rows = lambda _image: [
+            row("账号", 320, 150, 60),
+            row("不限", 80, 220, 60),
+            row("i厦门", 230, 360, 100),
+            row("厦门市民数据服务股份有限公司", 230, 405, 300),
+        ]
+
+        result = ocr.locate_search_result(Image.new("RGB", (1000, 1000)), "i厦门")
+        self.assertFalse(result["found"], result)
+
+    def test_same_name_prefers_public_account_over_video_and_service(self) -> None:
+        """同名视频号在最上方也不能被点击，公众号优先于服务号。"""
+        ocr = WeChatProfileOCR.__new__(WeChatProfileOCR)
+
+        def row(text: str, center_y: float) -> dict[str, object]:
+            return {
+                "text": text, "normalized": "".join(text.split()), "left": 230.0,
+                "right": 430.0, "top": center_y - 15, "bottom": center_y + 15,
+                "center_x": 330.0, "center_y": center_y, "confidence": 0.99,
+            }
+
+        ocr._rows = lambda _image: [
+            row("账号", 150),
+            row("厦门晚报", 300), row("视频号", 340),
+            row("厦门晚报", 500), row("服务号", 540),
+            row("厦门晚报", 700), row("公众号", 740), row("127篇原创内容", 780),
+        ]
+        result = ocr.locate_search_result(Image.new("RGB", (1000, 1000)), "厦门晚报")
+        self.assertTrue(result["found"], result)
+        self.assertEqual(result["account_type"], "公众号")
+        self.assertEqual(result["center_y_1000"], 700)
+
+    def test_exact_video_does_not_hide_safe_suffix_public_account(self) -> None:
+        """完全同名视频号不能让“名称+媒体”的公众号退出候选集合。"""
+        ocr = WeChatProfileOCR.__new__(WeChatProfileOCR)
+
+        def row(text: str, center_y: float) -> dict[str, object]:
+            return {
+                "text": text, "normalized": "".join(text.split()), "left": 230.0,
+                "right": 470.0, "top": center_y - 15, "bottom": center_y + 15,
+                "center_x": 350.0, "center_y": center_y, "confidence": 0.99,
+            }
+
+        ocr._rows = lambda _image: [
+            row("账号", 150),
+            row("厦门晚报 媒体", 300), row("公众号", 340), row("1299篇原创内容", 380),
+            row("厦门晚报", 600), row("视频号∞", 640),
+        ]
+        result = ocr.locate_search_result(Image.new("RGB", (1000, 1000)), "厦门晚报")
+        self.assertTrue(result["found"], result)
+        self.assertEqual(result["matched_name"], "厦门晚报 媒体")
+        self.assertEqual(result["account_type"], "公众号")
+        self.assertEqual(result["candidate_types"], ["公众号", "视频号"])
+
+    def test_same_name_uses_service_only_when_public_account_absent(self) -> None:
+        ocr = WeChatProfileOCR.__new__(WeChatProfileOCR)
+
+        def row(text: str, center_y: float) -> dict[str, object]:
+            return {
+                "text": text, "normalized": "".join(text.split()), "left": 230.0,
+                "right": 430.0, "top": center_y - 15, "bottom": center_y + 15,
+                "center_x": 330.0, "center_y": center_y, "confidence": 0.99,
+            }
+
+        ocr._rows = lambda _image: [
+            row("账号", 150),
+            row("i厦门", 300), row("视频号", 340),
+            row("i厦门", 500), row("服务号", 540),
+        ]
+        result = ocr.locate_search_result(Image.new("RGB", (1000, 1000)), "i厦门")
+        self.assertTrue(result["found"], result)
+        self.assertEqual(result["account_type"], "服务号")
+        self.assertEqual(result["center_y_1000"], 500)
+
+    def test_service_profile_does_not_require_service_type_or_description(self) -> None:
+        """按 i厦门实际资料页，只使用名称、关注和内容导航确认身份。"""
+        ocr = WeChatProfileOCR.__new__(WeChatProfileOCR)
+
+        def row(text: str, center_y: float) -> dict[str, object]:
+            return {
+                "text": text,
+                "normalized": "".join(text.split()),
+                "left": 100.0,
+                "right": 320.0,
+                "top": center_y - 15,
+                "bottom": center_y + 15,
+                "center_x": 210.0,
+                "center_y": center_y,
+                "confidence": 0.99,
+            }
+
+        ocr._rows = lambda _image: [
+            row("i厦门", 120),
+            row("厦门市民数据服务股份有限公司", 160),
+            row("福建 厦门", 200),
+            row("104篇原创内容", 280),
+            row("关注", 360),
+            row("全部", 430),
+            row("贴图", 430),
+            row("文章", 430),
+            row("视频号", 430),
+            row("昨天", 560),
+        ]
+        result = ocr.validate_profile_header(
+            Image.new("RGB", (1000, 1000)), "i厦门"
+        )
+        self.assertTrue(result["matched"], result)
+        self.assertNotIn("服务号", result["structural_terms"])
+
+    def test_profile_identity_uses_viewport_name_and_structure(self) -> None:
+        """名称不在顶部时，只要整页结构成立仍可确认资料页。"""
+        ocr = WeChatProfileOCR.__new__(WeChatProfileOCR)
+
+        def row(text: str, center_y: float) -> dict[str, object]:
+            return {
+                "text": text,
+                "normalized": "".join(text.split()),
+                "left": 100.0,
+                "right": 260.0,
+                "top": center_y - 15,
+                "bottom": center_y + 15,
+                "center_x": 180.0,
+                "center_y": center_y,
+                "confidence": 0.99,
+            }
+
+        ocr._rows = lambda _image: [
+            row("厦门日报", 330),
+            row("全部", 450),
+            row("文章", 450),
+        ]
+        result = ocr.validate_profile_header(
+            Image.new("RGB", (1000, 1000)), "厦门日报"
+        )
+        self.assertTrue(result["matched"], result)
+        self.assertIn("viewport", result["method"])
+
+    def test_search_result_name_alone_is_not_profile_identity(self) -> None:
+        """搜索结果出现同名账号，但没有资料页结构时不得误判。"""
+        ocr = WeChatProfileOCR.__new__(WeChatProfileOCR)
+        ocr._rows = lambda _image: [
+            {
+                "text": "i厦门",
+                "normalized": "i厦门",
+                "left": 100.0,
+                "right": 200.0,
+                "top": 300.0,
+                "bottom": 330.0,
+                "center_x": 150.0,
+                "center_y": 315.0,
+                "confidence": 0.99,
+            }
+        ]
+        result = ocr.validate_profile_header(
+            Image.new("RGB", (1000, 1000)), "i厦门"
+        )
+        self.assertFalse(result["matched"], result)
+
+    def test_search_page_with_name_and_navigation_is_not_profile_identity(self) -> None:
+        """输入框账号名和搜索导航同时出现时仍必须判定为搜一搜页面。"""
+        ocr = WeChatProfileOCR.__new__(WeChatProfileOCR)
+
+        def row(text: str, center_y: float) -> dict[str, object]:
+            return {
+                "text": text,
+                "normalized": "".join(text.split()),
+                "left": 100.0,
+                "right": 260.0,
+                "top": center_y - 15,
+                "bottom": center_y + 15,
+                "center_x": 180.0,
+                "center_y": center_y,
+                "confidence": 0.99,
+            }
+
+        ocr._rows = lambda _image: [
+            row("i厦门", 120),
+            row("搜索", 120),
+            row("全部", 220),
+            row("贴图", 220),
+            row("文章", 220),
+            row("视频号", 220),
+        ]
+        result = ocr.validate_profile_header(
+            Image.new("RGB", (1000, 1000)), "i厦门"
+        )
+        self.assertFalse(result["matched"], result)
+        self.assertIn("搜一搜页面", result["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

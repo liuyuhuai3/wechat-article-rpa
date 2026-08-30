@@ -92,6 +92,22 @@ class ProfileMetricAnchorTests(unittest.TestCase):
         self.assertEqual(feed["articles"][0]["list_read_count"], 5424)
         self.assertEqual(feed["articles"][0]["list_like_count"], 77)
 
+    def test_short_title_is_kept_when_metric_anchor_is_present(self) -> None:
+        """“图解政策”等短标题有同卡片指标证据时不能按噪声删除。"""
+        screenshot = Image.new("RGB", (1000, 1600), "white")
+        rows = [
+            row("星期四", 150, 620, 240, 650),
+            row("图解政策", 180, 1040, 300, 1070),
+            row("阅读114 赞1", 180, 1090, 360, 1120),
+        ]
+        detector = WeChatProfileOCR()
+        with patch.object(detector, "_rows", return_value=rows):
+            feed = detector.inspect_profile_feed(screenshot)
+
+        self.assertEqual([item["title"] for item in feed["articles"]], ["图解政策"])
+        self.assertEqual(feed["articles"][0]["list_read_count"], 114)
+        self.assertEqual(feed["articles"][0]["list_like_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
