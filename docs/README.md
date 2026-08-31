@@ -6,6 +6,7 @@
 |---|---|---|
 | `../README.md` | 当前有效 | 安装、命令入口和能力概览 |
 | `WECHAT_SEARCH_COLLECTION_FLOW.md` | 当前有效、唯一流程基线 | Win11 搜一搜、资料页缓存池、多账号轮询、文章采集、恢复和测试 |
+| `VM_DEPLOYMENT.md` | 当前有效 | Windows 生产部署、Linux/macOS 适配边界和多虚拟机迁移建议 |
 | `DATABASE.md` | 当前有效 | 可选 MongoDB 数据结构 |
 | `DOCKER.md` | 当前有效 | 可选 MongoDB 容器部署 |
 | `../SECURITY.md` | 当前有效 | 安全边界 |
@@ -24,4 +25,3 @@
 2. 按当前代码完整重写过期内容；
 3. 同步更新 `WECHAT_SEARCH_COLLECTION_FLOW.md`；
 4. 更新或新增对应测试并完成 Win11 冒烟验证。
-

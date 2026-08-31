@@ -30,6 +30,7 @@ class Win11WeChatAdapter:
         wait_for_stable_frames: Callable[[Any], Image.Image] | None = None,
         inspect_search_page: Callable[[Image.Image], bool] | None = None,
         same_search_page: Callable[[Image.Image, Image.Image], bool] | None = None,
+        identify_profile_account: Callable[[Image.Image, list[str]], dict[str, Any]] | None = None,
     ) -> None:
         self._activate_window = activate_window
         self._capture_window = capture_window
@@ -42,6 +43,7 @@ class Win11WeChatAdapter:
         self._wait_for_stable_frames = wait_for_stable_frames
         self._inspect_search_page = inspect_search_page
         self._same_search_page = same_search_page
+        self._identify_profile_account = identify_profile_account
         self.last_switch_steps = 0
         self.last_scan_completed_cycle = False
         self.last_scan_saw_search = False
@@ -193,6 +195,138 @@ class Win11WeChatAdapter:
             reason="tab_cycle_not_observed_before_safety_limit",
         )
         return False
+
+    def inventory_profile_tabs(
+        self,
+        window: Any,
+        expected_names: list[str],
+        *,
+        max_tabs: int = 96,
+        evidence_callback: Callable[[int, Image.Image, dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """只绕标签池一圈，同时登记全部监听账号资料页。
+
+        与 ``activate_profile_tab`` 的逐账号查找不同，本方法每个标签只执行一次
+        资料页 OCR。明确识别成其他监听账号时直接登记并切换；只有资料页结构
+        成立、头部身份确实不可见时才回到顶部重试。
+        """
+        if self._identify_profile_account is None:
+            raise RuntimeError("未配置资料页批量身份识别器")
+        accounts = list(dict.fromkeys(name for name in expected_names if name))
+        self._activate_window(window.hwnd)
+        profiles: dict[str, list[int]] = {}
+        search_anchor: Image.Image | None = None
+        first_search_probe: int | None = None
+        tabs_since_search = 0
+        completed_cycle = False
+        cycle_length: int | None = None
+
+        for probe_index in range(max_tabs):
+            screenshot = self._stable_capture(window)
+            identity = self._identify_profile_account(screenshot, accounts)
+            home_used = False
+
+            for retry_index in range(2):
+                if (
+                    identity.get("matched")
+                    or identity.get("profile_structure_found")
+                    or identity.get("search_page_evidence")
+                    or len(identity.get("observed_header_candidates") or []) > 1
+                ):
+                    break
+                self._sleep(0.35)
+                screenshot = self._stable_capture(window)
+                identity = self._identify_profile_account(screenshot, accounts)
+                self._log_event(
+                    "watch_profile_inventory_intermediate_retry",
+                    probe_index=probe_index + 1,
+                    retry=retry_index + 1,
+                    matched_account=identity.get("account"),
+                    profile_structure_found=bool(identity.get("profile_structure_found")),
+                    observed_header_candidates=identity.get("observed_header_candidates") or [],
+                )
+
+            if (
+                not identity.get("matched")
+                and identity.get("profile_structure_found")
+                and not identity.get("header_identity_visible")
+                and self._press_ctrl_home is not None
+            ):
+                home_used = True
+                self._press_ctrl_home()
+                screenshot = self._stable_capture(window)
+                identity = self._identify_profile_account(screenshot, accounts)
+                self._log_event(
+                    "watch_profile_inventory_retried_after_home",
+                    probe_index=probe_index + 1,
+                    matched=bool(identity.get("matched")),
+                    account=identity.get("account"),
+                    observed_header_candidates=identity.get("observed_header_candidates") or [],
+                )
+
+            account = identity.get("account") if identity.get("matched") else None
+            if account in accounts:
+                profiles.setdefault(account, []).append(probe_index)
+
+            is_search = bool(
+                not identity.get("profile_structure_found")
+                and self._inspect_search_page is not None
+                and self._inspect_search_page(screenshot)
+            )
+            self._log_event(
+                "watch_profile_inventory_probe",
+                probe_index=probe_index + 1,
+                matched_account=account,
+                observed_name=identity.get("name"),
+                observed_header_candidates=identity.get("observed_header_candidates") or [],
+                profile_structure_found=bool(identity.get("profile_structure_found")),
+                search_page=is_search,
+                ctrl_home_used=home_used,
+            )
+            if evidence_callback is not None and (
+                identity.get("profile_structure_found") and not account
+            ):
+                evidence_callback(probe_index + 1, screenshot, identity)
+
+            if is_search:
+                if search_anchor is None:
+                    search_anchor = screenshot
+                    first_search_probe = probe_index
+                    tabs_since_search = 0
+                elif tabs_since_search > 0 and (
+                    self._same_search_page is None
+                    or self._same_search_page(search_anchor, screenshot)
+                ):
+                    completed_cycle = True
+                    cycle_length = probe_index - int(first_search_probe or 0)
+                    break
+
+            if probe_index + 1 < max_tabs:
+                self._press_ctrl_tab()
+                if search_anchor is not None:
+                    tabs_since_search += 1
+                self._sleep(0.35)
+
+        primary_positions = {
+            account: positions[0]
+            for account, positions in profiles.items()
+            if positions
+        }
+        duplicate_positions = {
+            account: positions[1:]
+            for account, positions in profiles.items()
+            if len(positions) > 1
+        }
+        result = {
+            "completed_cycle": completed_cycle,
+            "cycle_length": cycle_length,
+            "profile_positions": primary_positions,
+            "duplicate_positions": duplicate_positions,
+            "profiles_found": [name for name in accounts if name in primary_positions],
+            "profiles_missing": [name for name in accounts if name not in primary_positions],
+        }
+        self._log_event("watch_profile_inventory_finished", **result)
+        return result
 
     def close_profile_tab_if_confirmed(
         self,

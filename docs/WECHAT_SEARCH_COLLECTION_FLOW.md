@@ -20,6 +20,7 @@
 - 采集器运行在 Windows 11 虚拟机的交互式桌面中。
 - 微信必须已登录，并已打开或能够打开“搜一搜”。
 - 采集器独占鼠标、键盘和微信窗口；运行期间不要人工操作。
+- 当前版本的窗口句柄、DPI、剪贴板、截图和键鼠控制依赖 Windows API；Linux/macOS 只属于后续适配方向，不能直接作为当前流程的可用运行环境。
 - 当前 Win11 微信页面主要使用内置 Chromium，搜一搜和公众号资料页可能共用同一个 `Chrome_WidgetWin_0` 窗口，并通过标签页切换页面。
 - 当前固定适配的 Win11 微信主界面为“左侧竖向功能栏 + 左侧会话列表 + 右侧聊天区”布局；主界面全局搜索框位于左侧会话栏顶部，约占窗口归一化坐标 `x=18.5%、y=8.0%`。从主界面恢复搜一搜时使用专用 OCR/布局定位，不再使用旧版主界面坐标。
 - 页面识别以截图、本地 OCR、模板匹配和必要的内网 Qwen-VL 复核为主，不依赖浏览器 DOM。
@@ -159,7 +160,7 @@ Win11 中不能只用窗口标题或 HWND 判断页面。搜一搜、资料页�
 8. 保存文章证据截图并识别底部互动指标。
 9. 再次复制文章 URL，确认采集互动指标期间页面没有切换。
 10. 将文章写入本地导出文件；启用 MongoDB 时执行幂等入库。
-11. 记录 `article_collect_succeeded`，关闭文章标签并返回资料页。
+11. 记录 `article_collect_succeeded`，关闭文章标签并返回资料页。`Ctrl+W` 后先在当前标签做最多三次短暂、无操作的本地校验：账号名称精确匹配，或不存在搜一搜证据且资料页导航结构成立，均可确认已经返回父资料页；此路径必须保持原滚动位置并继续处理当前页面候选队列。只有三次当前页校验均无法证明是资料页时，才允许执行有界全标签恢复扫描。
 
 文章详情页是最终数据来源：
 
@@ -179,7 +180,7 @@ Win11 中不能只用窗口标题或 HWND 判断页面。搜一搜、资料页�
 - 文章点击：比较点击前后的标签栏/页面截图，检测到明显导航变化后立即进入 URL 复制；超时仍走原有复制链接校验；
 - 资料页滚动：保留懒加载缓冲，由下一次 OCR 结果决定是否继续，不依赖固定等待作为页面成功依据。
 
-这些优化只减少无效等待，不放宽页面身份校验。文章标签仍必须逐篇关闭并确认回到资料页；搜一搜主窗口不作为文章清理对象。当前环境默认禁用 `Ctrl+Shift+PageUp` 标签移动，因为无法可靠确认该快捷键在 Win11 微信中生效。恢复流程找到搜一搜后直接保留该标签，不要求它位于首标签；清理阶段遇到未确认标签时保留现场，不批量关闭未知标签。
+这些优化只减少无效等待，不放宽页面身份校验。文章标签仍必须逐篇关闭并确认回到资料页；正常返回不得调用 `Ctrl+Home`，否则会破坏同一屏剩余文章卡片坐标。搜一搜主窗口不作为文章清理对象。当前环境默认禁用 `Ctrl+Shift+PageUp` 标签移动，因为无法可靠确认该快捷键在 Win11 微信中生效。恢复流程找到搜一搜后直接保留该标签，不要求它位于首标签；清理阶段遇到未确认标签时保留现场，不批量关闭未知标签。
 
 ## 5. 标题校验策略
 
@@ -246,7 +247,7 @@ URL 规范化会统一协议、域名大小写、查询参数顺序并移除片�
 
 ### 7.2 清理原则
 
-文章处理无论成功、跳过还是异常，都会进入标签清理流程。清理时必须保留资料页目标标签。正常路径只关闭已确认的当前文章标签；恢复路径只扫描并保留已确认的搜一搜标签，不依赖首标签或标签移动快捷键，也不批量关闭未知标签，否则可能误关搜一搜或公众号资料页。
+文章处理无论成功、跳过还是异常，都会进入标签清理流程。清理时必须保留资料页目标标签。正常路径只关闭已确认的当前文章标签；关闭后优先接受当前标签的资料页结构证据，跳过全标签扫描并保留滚动位置。只有即时返回校验失败时才进入有界恢复路径；恢复路径不依赖首标签或标签移动快捷键，也不批量关闭未知标签，否则可能误关搜一搜或公众号资料页。
 
 ### 7.3 应保留的诊断文件
 
@@ -320,6 +321,26 @@ URL 规范化会统一协议、域名大小写、查询参数顺序并移除片�
 
 ### 10.1 启动命令
 
+常驻监听推荐把资料页池预热与文章采集拆成两个进程阶段，并且两个命令必须使用同一个输出目录和同一账号文件。
+
+第一步只建立资料页池，成功后保留微信中的一个搜一搜标签和最多十个资料页标签，进程自行退出：
+
+```powershell
+.venv\Scripts\python.exe wechat_visual_rpa.py --watch-accounts-file ".\config\watch-accounts.txt" --bootstrap-profile-pool --live --local-only --accounts-per-vm 10 --output-dir ".\output\watch-vm-01"
+```
+
+该命令只写 `profile-pool-state.json`，不创建或更新文章增量 `watch-state.json` 与轮询 `scheduler-state.json`。
+
+第二步只附着现有资料页池并采集，不在启动阶段重新搜索十个账号：
+
+```powershell
+.venv\Scripts\python.exe wechat_visual_rpa.py --watch-accounts-file ".\config\watch-accounts.txt" --watch-existing-profile-pool --live --local-only --accounts-per-vm 10 --poll-interval 600 --recent-card-limit 3 --metrics share --output-dir ".\output\watch-vm-01"
+```
+
+修改采集代码后，只停止第二个进程，不关闭微信标签；更新代码后再次执行第二个命令。新进程必须对现有标签重新进行 OCR 登记，不能直接复用状态文件中的旧 HWND 或旧标签序号。热更新附着只允许绕现有标签池一圈：每个标签执行一次 OCR，并将识别出的全部监听账号一次性登记到内存；禁止为十个账号分别重复扫描同一标签池。某账号完成“账号名精确匹配 + 资料页结构成立”后应立即登记为 `ready`，不得继续寻找搜一搜标签，也不得在每个账号附着后自动执行全标签重复页扫描。附着失败的账号保持 `temporarily_unverified` 并跳过本轮，热更新入口禁止因此自动搜索、全量重建或关闭其他账号标签。
+
+原有不带上述两个参数的监听命令暂时保留为“预热后立即监听”的兼容入口；正式全天监听及代码热更新优先使用两条独立命令。
+
 ```powershell
 .venv\Scripts\python.exe wechat_visual_rpa.py --watch-account "厦门日报" --live --poll-interval 300 --recent-card-limit 3 --metrics share --output-dir ".\output\watch-xiamen"
 ```
@@ -366,10 +387,18 @@ flowchart TD
 
 ### 10.3 状态、去重与输出
 
-监听目录中的 `watch-state.json` 保存：账号名、已知规范化文章 URL、轮数、最近一轮时间、最近错误、最近轮摘要和时间窗口状态。每轮结果保存到独立目录：
+监听状态拆分为三个边界明确的文件：
+
+- 根目录 `profile-pool-state.json`：账号清单、资料页状态、资料页诊断登记、最近预热/附着时间；其中 HWND 只用于诊断，不可跨进程直接复用。
+- 根目录 `scheduler-state.json`：轮询轮数、调度阶段、时间窗口和调度错误，不保存资料页登记。
+- 每账号 `watch-state.json`：账号名、已知规范化文章 URL、轮数、最近一轮时间、最近错误、最近轮摘要和时间窗口状态，不保存 `profile`。
+
+每轮结果保存到独立目录：
 
 ```text
 output/watch-xiamen/
+├── profile-pool-state.json
+├── scheduler-state.json
 ├── watch-state.json
 ├── articles.jsonl
 ├── articles.csv
@@ -382,6 +411,7 @@ output/watch-xiamen/
 
 ```text
 output/watch-vm-01/
+├── profile-pool-state.json
 ├── scheduler-state.json
 ├── articles.jsonl
 ├── articles.csv
@@ -395,7 +425,9 @@ output/watch-vm-01/
 
 启动时若启用 `--write-mongo`，监听器还会从 `weixin.article` 按账号读取已有 URL，补充本地状态。文章详情页得到的规范化 URL 是唯一去重依据；标题 OCR 不参与跨轮次去重。
 
-关键监听日志包括：`watch_scheduler_started`、`watch_profile_bootstrap_started`、`watch_profile_bootstrap_attempt`、`watch_profile_bootstrap_existing_tab_reused`、`watch_profile_bootstrap_succeeded`、`watch_profile_bootstrap_failed`、`watch_profile_bootstrap_finished`、`watch_account_cycle_started`、`watch_account_cycle_finished`、`watch_scheduler_sleeping`、`search_submitted`、`search_result_layout_ready`、`search_suggestion_dismiss_requested`、`search_suggestion_dismiss_confirmed`、`search_result_page_confirmed`、`profile_tab_switch_requested`、`profile_tab_switch_reused_current`、`profile_tab_probe`、`profile_tab_intermediate_retry`、`profile_identity_retried_after_home`、`profile_identity_confirmed`、`profile_slot_recovery`、`profile_tab_scan_cycle_completed`、`profile_tab_scan_limit_reached`、`search_recovery_target_profile_reused`、`profile_rebuild_cancelled_existing_tab_found`、`profile_account_primary_selected`、`profile_account_duplicate_closed`、`profile_tab_reused`、`profile_refresh_requested`、`profile_refresh_completed`、`profile_refresh_failed`、`profile_refresh_recovered_by_local_scan`、`profile_feed_local_empty_range`、`profile_tab_preserved`、`profile_tab_preserve_temporarily_unverified`、`watch_window_opened`、`watch_outside_schedule`、`watch_window_closed`、`watch_scheduler_stopped` 和 `incremental_known_url_stop`。
+独立预热进程以 `watch_profile_pool_process_started` 开始。热更新附着使用 `watch_profile_inventory_started` 开始单圈盘点，每个标签记录 `watch_profile_inventory_probe`，结束记录 `watch_profile_inventory_finished` 和 `watch_profile_pool_inventory_applied`。精确匹配成功后逐账号记录 `watch_profile_attach_registered_without_dedup`，表示该账号只完成内存登记，没有再次寻找搜一搜或执行全标签去重。结构成立但无法映射到监听账号的页面必须保存 `profile-pool-inventory/<时间>/probe-*-unresolved-profile.png`，并通过 `watch_profile_inventory_evidence_saved` 记录 OCR 头部候选。某账号启动时未附着成功，后续轮次只允许通过 `watch_profile_pool_reattached` 本地重新附着，失败记录 `watch_profile_pool_reattach_failed`，不得自动进入搜一搜重建。
+
+关键监听日志包括：`watch_scheduler_started`、`watch_profile_bootstrap_started`、`watch_profile_bootstrap_attempt`、`watch_profile_bootstrap_existing_tab_reused`、`watch_profile_bootstrap_succeeded`、`watch_profile_bootstrap_failed`、`watch_profile_bootstrap_finished`、`watch_profile_pool_attach_started`、`watch_profile_pool_attach_succeeded`、`watch_profile_pool_attach_failed`、`watch_profile_pool_attach_finished`、`watch_account_cycle_started`、`watch_account_cycle_finished`、`watch_scheduler_sleeping`、`search_submitted`、`search_result_layout_ready`、`search_suggestion_dismiss_requested`、`search_suggestion_dismiss_confirmed`、`search_result_page_confirmed`、`profile_tab_switch_requested`、`profile_tab_switch_reused_current`、`profile_tab_probe`、`profile_tab_intermediate_retry`、`profile_identity_retried_after_home`、`profile_identity_confirmed`、`profile_slot_recovery`、`profile_tab_scan_cycle_completed`、`profile_tab_scan_limit_reached`、`search_recovery_target_profile_reused`、`profile_rebuild_cancelled_existing_tab_found`、`profile_account_primary_selected`、`profile_account_duplicate_closed`、`profile_tab_reused`、`profile_refresh_requested`、`profile_refresh_completed`、`profile_refresh_failed`、`profile_refresh_recovered_by_local_scan`、`profile_feed_local_empty_range`、`profile_tab_preserved`、`profile_tab_preserve_temporarily_unverified`、`watch_window_opened`、`watch_outside_schedule`、`watch_window_closed`、`watch_scheduler_stopped` 和 `incremental_known_url_stop`。
 
 ### 10.4 有限测试
 
@@ -497,6 +529,16 @@ flowchart TD
 9. 文章标签只保留当前文章；采集完成、跳过或失败后，只关闭已确认的文章标签。
 10. 微信重启或虚拟机重启后，不复用旧 HWND、标签序号或窗口位置；根据各账号状态重新执行资料页预热。仅监听进程重启而微信标签仍存在时，可根据旧注册表触发一次整屏 OCR 盘点并复用现有资料页；只有缺失账号才重新搜索，避免重复标签累积。
 
+热更新附着的单圈盘点规则：
+
+1. 从当前标签开始逐个 `Ctrl+Tab`，一次 OCR 同时与全部监听账号名称比较；识别到任一账号后立即登记其相对位置，不再为其他账号重复读取该截图。
+2. 页面已经明确识别为另一个监听账号时，直接登记并切换下一个标签，不发送 `Ctrl+Home`。
+3. 只有资料页结构成立、同时头部没有可用身份文字时，才允许发送一次 `Ctrl+Home`，等待稳定后重试当前标签。
+4. 首次遇到搜一搜工作面时保存绕圈锚点；再次回到同一工作面才算盘点完整。96 次仍只作为异常安全上限。空白、加载动画或 OCR 文字极少时通过 `watch_profile_inventory_intermediate_retry` 在当前标签重试，不能立即切走。
+5. 完整盘点后批量写入 `profile_registry`：已识别账号为 `ready`，未识别账号为 `temporarily_unverified`；热接管不得因为缺失账号进入搜索重建。
+6. 单圈中发现同账号多个精确资料页时只记录重复位置和 `watch_profile_inventory_duplicate_observed`，本阶段不自动关闭任何标签。
+7. 盘点得到的账号相对位置只在当前进程内学习，用于后续轮询快速切换；微信或虚拟机重启后重新盘点。
+
 窗口清理规则：
 
 - 不按“窗口标题=微信”批量关闭窗口，因为搜一搜、资料页和文章页可能共用 `Chrome_WidgetWin_0`。
@@ -504,6 +546,7 @@ flowchart TD
 - 搜一搜标签和已验证资料页标签属于监听器资源，整个进程期间保留。
 - 启动时发现的未知标签不自动关闭；只有未来建立了可验证的“本次运行创建标签”登记后，才允许定向清理。
 - 同账号存在多个资料页时，从已确认搜一搜工作面开始扫描，保留第一个完整校验成功的资料页作为主标签；后续只有再次满足“账号名精确匹配 + 资料页结构成立 + 不是文章页 + 不是搜一搜页”才允许关闭。每次只关闭一个重复页，随后重新从搜一搜工作面开始，其他账号和未知标签一律不动。
+- 热更新附着不是重复标签维护入口。即使状态文件中已有资料页登记，附着成功后也只更新当前进程内的资料页缓存；只有运行期间已经获得两个同账号资料页的精确身份凭据，才允许显式进入上述账号级定向去重流程。
 - 全量清理不是日常恢复动作，只允许用于标签池严重失控、搜一搜无法定位、多数账号均需重建，或微信/虚拟机重启导致登记整体失效的人工维护场景。
 
 资料页恢复扫描从已确认搜一搜工作面建立锚点，逐个 `Ctrl+Tab`，每个标签等待连续两帧稳定后再识别；只有再次回到同一个搜一搜工作面才证明完成一圈。96 次仅为异常安全上限，达到上限但未确认绕圈时必须进入 `temporarily_unverified`，不能宣称资料页不存在或重新搜索。扫描和搜一搜恢复的每一步均先识别当前是否为目标资料页；若是，立即取消搜索恢复并重新登记。成功路径会学习“来源账号→目标账号”的相对切换步数，直达验证失败时删除该热路径。所有热路径只在本次监听进程、本次资料页预热池内有效。
@@ -529,7 +572,7 @@ flowchart TD
 
 一台虚拟机保留 10 个账号是资源和稳定性的初始上限，不是代码中的永久硬限制。必须以 Win11 固定微信版本实测每轮耗时后再调整。若每个账号热路径平均耗时 20～30 秒，10 个账号一轮约需 3～5 分钟；若仍然走每轮完整搜索流程，10 个账号可能超过 10 分钟，不能宣称达到 10 分钟轮询目标。
 
-多账号调度器已作为当前常驻监听入口实现。启动时会记录 `watch_profile_bootstrap_started`、`watch_profile_bootstrap_succeeded`、`watch_profile_bootstrap_failed` 和 `watch_profile_bootstrap_finished`，并在 `scheduler-state.json` 中保存 `phase`、`profile_registry`、`profiles_ready` 与 `profiles_unavailable`。进入轮询后，单账号和多账号监听均进入统一的资料页调度路径；单账号只是账号列表只有一项的兼容场景，URL 去重、页面校验、失败清理和输出格式保持不变。
+多账号调度器已支持独立资料页池预热与热更新附着。`profile_registry`、`profiles_ready` 与 `profiles_unavailable` 只写入 `profile-pool-state.json`；`scheduler-state.json` 不再承担 UI 资源登记。进入轮询后，单账号和多账号监听均进入统一的资料页调度路径；单账号只是账号列表只有一项的兼容场景，URL 去重、页面校验、失败清理和输出格式保持不变。
 
 ## 11. 维护规则
 
@@ -545,3 +588,5 @@ flowchart TD
 - 单账号监听升级为多账号调度，包括资料页缓存池、账号切换、到期队列和失败退避。
 
 同步工作至少包括：更新本文对应章节、更新 README 中的运行说明（若命令或前置条件改变）、新增或调整离线测试，并在固定 Win11 微信版本上重新执行单账号最小闭环。
+
+跨平台部署说明见 [`docs/VM_DEPLOYMENT.md`](./VM_DEPLOYMENT.md)：Windows 11 是当前生产基线；Linux + X11 需要先完成桌面适配层并重新验收；macOS 虚拟机不属于默认部署方案。跨平台适配完成前，不得把 Linux 或 macOS 的虚拟机启动成功视为采集链路可用。

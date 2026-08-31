@@ -1052,6 +1052,115 @@ class WeChatProfileOCR:
             "search_page_evidence": search_page_evidence,
         }
 
+    def identify_profile_account(
+        self,
+        screenshot: Image.Image,
+        expected_names: list[str],
+    ) -> dict[str, Any]:
+        """一次 OCR 识别资料页结构及其所属监听账号。
+
+        热更新附着不能为十个账号分别对同一标签重复 OCR。本方法先只做一次
+        ``_rows``，再将资料页头部候选与全部监听账号进行安全精确匹配。只有
+        资料页结构和账号名称同时成立时才返回账号；其他资料页保留候选文本供
+        日志和截图审计，不会被误登记或自动关闭。
+        """
+        width, height = screenshot.size
+        rows = self._rows(screenshot)
+        accounts = list(dict.fromkeys(name.strip() for name in expected_names if name.strip()))
+        navigation_rows = [
+            row
+            for row in rows
+            if row["normalized"] in {"全部", "贴图", "文章", "视频号"}
+            and row["center_y"] < height * 0.60
+        ]
+        navigation_terms = sorted({row["normalized"] for row in navigation_rows})
+        aligned_navigation_count = max(
+            (
+                len(
+                    {
+                        candidate["normalized"]
+                        for candidate in navigation_rows
+                        if abs(candidate["center_y"] - anchor["center_y"])
+                        <= height * 0.035
+                    }
+                )
+                for anchor in navigation_rows
+            ),
+            default=0,
+        )
+        search_page_evidence = sorted(
+            {
+                row["normalized"]
+                for row in rows
+                if row["center_y"] < height * 0.55
+                and (
+                    row["normalized"] == "搜索"
+                    or row["normalized"].endswith("-账号")
+                    or row["normalized"].endswith("—账号")
+                )
+            }
+        )
+        structural_match = bool(
+            not search_page_evidence and aligned_navigation_count >= 2
+        )
+        header_rows = [
+            row
+            for row in rows
+            if height * 0.055 < row["center_y"] < height * 0.30
+            and row["center_x"] < width * 0.90
+        ]
+        ignored_header_terms = {
+            "关注", "私信", "全部", "贴图", "文章", "视频号",
+            "公众号", "服务号", "展开", "置顶", "今天", "昨天",
+        }
+        observed_header_candidates = [
+            row["text"]
+            for row in header_rows
+            if row["normalized"] not in ignored_header_terms
+        ][:12]
+
+        matches: list[tuple[int, dict[str, Any], str, str]] = []
+        for account_index, account in enumerate(accounts):
+            for row in header_rows:
+                matched, method = _account_name_match(account, row["text"])
+                if matched:
+                    matches.append((account_index, row, account, method))
+        if not structural_match or not matches:
+            return {
+                "matched": False,
+                "account": None,
+                "name": None,
+                "reason": (
+                    "资料页结构成立但未识别到监听账号名称"
+                    if structural_match
+                    else "当前页面缺少资料页结构证据"
+                ),
+                "observed_header_candidates": observed_header_candidates,
+                "header_identity_visible": bool(observed_header_candidates),
+                "structural_terms": navigation_terms,
+                "profile_structure_found": structural_match,
+                "aligned_navigation_count": aligned_navigation_count,
+                "search_page_evidence": search_page_evidence,
+            }
+
+        account_index, row, account, method = min(
+            matches,
+            key=lambda item: (item[1]["center_y"], item[0]),
+        )
+        return {
+            "matched": True,
+            "account": account,
+            "name": row["text"],
+            "confidence": row["confidence"],
+            "method": f"rapidocr-profile-inventory-{method}",
+            "observed_header_candidates": observed_header_candidates,
+            "header_identity_visible": True,
+            "structural_terms": navigation_terms,
+            "profile_structure_found": True,
+            "aligned_navigation_count": aligned_navigation_count,
+            "search_page_evidence": search_page_evidence,
+        }
+
     def inspect_profile_layout(self, screenshot: Image.Image) -> dict[str, Any]:
         """提取资料页结构证据，仅用于诊断和 Qwen-VL 触发，不替代账号校验。"""
         width, height = screenshot.size

@@ -231,6 +231,20 @@ config\control_panel.json
 
 ## 局域网与虚拟机部署
 
+### 平台支持与多虚拟机建议
+
+当前采集器是**Windows 微信桌面客户端的视觉自动化程序**，生产支持边界仍是 Windows 11 交互式桌面。代码中的窗口句柄、剪贴板、DPI、截图和键鼠控制均依赖 Windows API；Linux 或 macOS 虚拟机不能直接运行当前采集闭环。
+
+| 部署方式 | 当前状态 | 适合场景 |
+|---|---|---|
+| Windows 11 虚拟机 | 当前生产推荐，兼容性最高 | 立即上线、优先保证采集稳定性 |
+| Linux ARM64/x86_64 + X11 虚拟机 | 规划中的低资源方案，需重写桌面适配层并重新验收微信流程 | 同一台宿主机部署较多实例 |
+| macOS 虚拟机 | 不作为当前部署目标，需重写适配层并处理辅助功能/屏幕录制权限 | 只有明确要求使用 macOS 微信客户端时考虑 |
+
+在 Apple Silicon 宿主机上，如果暂时不改代码，仍应创建 Windows 11 虚拟机作为生产基线；如果目标是降低多实例负担，应先用一台 ARM64 Linux + X11 虚拟机做移植试验，不能把“能启动 Linux 桌面”当成采集链路已经兼容。Linux 试验必须使用完整的可交互图形桌面和虚拟显示器，Docker 或无界面终端环境不满足当前流程要求。
+
+多虚拟机部署时，每台虚拟机应使用独立的微信登录会话、独立输出目录和独立资料页池。不要让两个实例同时控制同一个微信账号。Linux 适配完成前，建议先按每台 Windows 11 虚拟机不超过 10 个账号进行固定版本实测；这个数量是稳定性初始上限，不是永久硬限制。
+
 ### 推荐虚拟机规格
 
 | 项目 | 推荐 |
@@ -411,8 +425,24 @@ MONGO_URI=mongodb://127.0.0.1:27017/
   --metrics share --output-dir ".\output\watch-vm-01"
 ```
 
-多账号监听采用两阶段流程：启动时按账号列表直接逐个搜索并验证公众号资料页，建立本轮资料页缓存池；预热阶段不会为每个尚未建池的账号先扫描全部旧标签。进入轮询后只激活目标资料页并使用 `Ctrl+R` 刷新，不再每轮重新搜索。程序会保留一个常驻搜一搜标签和最多 10 个已验证资料页标签；每个账号独立保存 `watch-state.json`，根目录保存带有 `profile_registry` 的 `scheduler-state.json`。缓存资料页激活失败时最多完成一次标签循环，随后直接局部重建当前账号，不会在搜索入口再次重复扫描。预热失败的账号只在自己的轮次中局部重建，首次验证可增加
-`--watch-cycles 2 --poll-interval 30`。
+多账号监听支持把资料页池和采集进程完全分开。先只建立资料页池：
+
+```powershell
+.\.venv\Scripts\python.exe .\wechat_visual_rpa.py `
+  --watch-accounts-file ".\config\watch-accounts.txt" --bootstrap-profile-pool --live `
+  --local-only --accounts-per-vm 10 --output-dir ".\output\watch-vm-01"
+```
+
+完成后保留微信标签，再启动只复用现有资料页的采集进程：
+
+```powershell
+.\.venv\Scripts\python.exe .\wechat_visual_rpa.py `
+  --watch-accounts-file ".\config\watch-accounts.txt" --watch-existing-profile-pool --live `
+  --local-only --accounts-per-vm 10 --poll-interval 600 --recent-card-limit 3 `
+  --metrics share --output-dir ".\output\watch-vm-01"
+```
+
+更新采集代码时只停止第二个进程，不关闭微信；重新执行第二条命令后，程序通过 OCR 重新登记现有标签，不会直接复用旧 HWND，也不会因某个账号附着失败而在启动阶段重新搜索全部账号。根目录 `profile-pool-state.json` 保存资料页池，`scheduler-state.json` 只保存调度进度，每账号 `watch-state.json` 只保存 URL 与采集轮次。
 
 每天定时在 07:30～24:00 之间监听：
 

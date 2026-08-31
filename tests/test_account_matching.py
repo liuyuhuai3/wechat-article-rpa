@@ -357,6 +357,44 @@ class AccountMatchingTests(unittest.TestCase):
         self.assertFalse(result["matched"], result)
         self.assertIn("搜一搜页面", result["reason"])
 
+    def test_profile_inventory_identifies_one_of_multiple_accounts_with_one_ocr(self) -> None:
+        ocr = WeChatProfileOCR.__new__(WeChatProfileOCR)
+        calls = 0
+
+        def row(text: str, center_y: float) -> dict[str, object]:
+            return {
+                "text": text,
+                "normalized": "".join(text.split()),
+                "left": 100.0,
+                "right": 300.0,
+                "top": center_y - 15,
+                "bottom": center_y + 15,
+                "center_x": 200.0,
+                "center_y": center_y,
+                "confidence": 0.99,
+            }
+
+        def rows(_image: Image.Image) -> list[dict[str, object]]:
+            nonlocal calls
+            calls += 1
+            return [
+                row("厦门晚报", 120),
+                row("全部", 300),
+                row("贴图", 300),
+                row("文章", 300),
+                row("视频号", 300),
+            ]
+
+        ocr._rows = rows
+        result = ocr.identify_profile_account(
+            Image.new("RGB", (1000, 1000)),
+            ["厦门日报", "厦门晚报", "海西晨报"],
+        )
+
+        self.assertTrue(result["matched"], result)
+        self.assertEqual(result["account"], "厦门晚报")
+        self.assertEqual(calls, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

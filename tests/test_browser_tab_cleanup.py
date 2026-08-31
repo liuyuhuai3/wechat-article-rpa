@@ -231,6 +231,118 @@ class BrowserTabCleanupTests(unittest.TestCase):
         self.assertTrue(closed)
         close_tab.assert_called_once()
 
+    def test_direct_close_accepts_scrolled_parent_profile_without_global_scan(self) -> None:
+        """文章关闭后资料页名称不可见时，结构证据应保留滚动位置并跳过全标签扫描。"""
+        window = rpa.WindowInfo(
+            hwnd=100,
+            title="微信",
+            class_name="Chrome_WidgetWin_0",
+            rect=rpa.Rect(0, 0, 1000, 800),
+            page_kind="embedded_profile_tab",
+        )
+        image = Image.new("RGB", (1000, 800), "white")
+        article_page = {
+            "found": False,
+            "search_box": {"found": False},
+            "account_tab": {"found": False},
+        }
+
+        with (
+            patch.object(rpa, "find_article_window", return_value=(window.hwnd, window.rect)),
+            patch.object(rpa.user32, "GetForegroundWindow", return_value=window.hwnd),
+            patch.object(rpa, "capture_window", return_value=image),
+            patch.object(rpa, "_inspect_sogou_search_results", return_value=article_page),
+            patch.object(
+                rpa.PROFILE_OCR,
+                "validate_profile_header",
+                side_effect=[
+                    {"matched": False, "profile_structure_found": False},
+                    {
+                        "matched": False,
+                        "profile_structure_found": True,
+                        "aligned_navigation_count": 3,
+                        "search_page_evidence": [],
+                    },
+                ],
+            ),
+            patch.object(rpa, "press_ctrl_w") as close_tab,
+            patch.object(rpa, "activate_embedded_profile_tab") as global_scan,
+            patch.object(rpa, "log_event") as log_event,
+        ):
+            closed = rpa.close_current_article_tab(
+                "厦门日报",
+                "测试文章",
+                return_window=window,
+            )
+
+        self.assertTrue(closed)
+        close_tab.assert_called_once()
+        global_scan.assert_not_called()
+        self.assertTrue(
+            any(
+                call.args[0] == "article_tab_closed_directly"
+                and call.kwargs.get("global_profile_scan_skipped") is True
+                for call in log_event.call_args_list
+            )
+        )
+
+    def test_direct_close_uses_global_scan_only_when_immediate_return_is_not_profile(self) -> None:
+        """当前返回页没有资料页结构时，才允许进入原有安全扫描。"""
+        window = rpa.WindowInfo(
+            hwnd=100,
+            title="微信",
+            class_name="Chrome_WidgetWin_0",
+            rect=rpa.Rect(0, 0, 1000, 800),
+            page_kind="embedded_profile_tab",
+        )
+        image = Image.new("RGB", (1000, 800), "white")
+        article_page = {
+            "found": False,
+            "search_box": {"found": False},
+            "account_tab": {"found": False},
+        }
+
+        with (
+            patch.object(rpa, "find_article_window", return_value=(window.hwnd, window.rect)),
+            patch.object(rpa.user32, "GetForegroundWindow", return_value=window.hwnd),
+            patch.object(rpa, "capture_window", return_value=image),
+            patch.object(rpa, "_inspect_sogou_search_results", return_value=article_page),
+            patch.object(
+                rpa.PROFILE_OCR,
+                "validate_profile_header",
+                side_effect=[
+                    {"matched": False, "profile_structure_found": False},
+                    {
+                        "matched": False,
+                        "profile_structure_found": False,
+                        "search_page_evidence": [],
+                    },
+                    {
+                        "matched": False,
+                        "profile_structure_found": False,
+                        "search_page_evidence": [],
+                    },
+                    {
+                        "matched": False,
+                        "profile_structure_found": False,
+                        "search_page_evidence": [],
+                    },
+                    {"matched": True, "profile_structure_found": True},
+                ],
+            ),
+            patch.object(rpa, "press_ctrl_w"),
+            patch.object(rpa, "activate_embedded_profile_tab", return_value=True) as global_scan,
+            patch.object(rpa, "log_event"),
+        ):
+            closed = rpa.close_current_article_tab(
+                "厦门日报",
+                "测试文章",
+                return_window=window,
+            )
+
+        self.assertTrue(closed)
+        global_scan.assert_called_once_with(window, "厦门日报")
+
     def test_cleanup_falls_back_when_direct_close_is_uncertain(self) -> None:
         """无法确认当前标签是文章时，仍使用原有安全恢复流程。"""
         with (

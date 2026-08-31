@@ -171,6 +171,85 @@ class Win11AdapterTests(unittest.TestCase):
         self.assertTrue(adapter.last_scan_completed_cycle)
         self.assertEqual(self.press_ctrl_tab.call_count, 2)
 
+    def test_inventory_registers_all_accounts_in_one_tab_cycle(self) -> None:
+        identify = Mock(
+            side_effect=[
+                {
+                    "matched": False,
+                    "profile_structure_found": False,
+                    "search_page_evidence": ["搜索"],
+                },
+                {
+                    "matched": True,
+                    "account": "厦门日报",
+                    "name": "厦门日报",
+                    "profile_structure_found": True,
+                    "header_identity_visible": True,
+                },
+                {
+                    "matched": True,
+                    "account": "厦门晚报",
+                    "name": "厦门晚报",
+                    "profile_structure_found": True,
+                    "header_identity_visible": True,
+                },
+                {
+                    "matched": False,
+                    "profile_structure_found": False,
+                    "search_page_evidence": ["搜索"],
+                },
+            ]
+        )
+        adapter = Win11WeChatAdapter(
+            activate_window=self.activate_window,
+            capture_window=Mock(return_value=Image.new("RGB", (10, 10), "black")),
+            validate_profile_header=self.validate_profile_header,
+            press_ctrl_tab=self.press_ctrl_tab,
+            press_ctrl_w=self.press_ctrl_w,
+            log_event=self.log_event,
+            sleep=Mock(),
+            identify_profile_account=identify,
+            inspect_search_page=Mock(side_effect=[True, True]),
+            same_search_page=Mock(return_value=True),
+        )
+
+        result = adapter.inventory_profile_tabs(
+            self.window,
+            ["厦门日报", "厦门晚报"],
+            max_tabs=8,
+        )
+
+        self.assertTrue(result["completed_cycle"])
+        self.assertEqual(result["profiles_found"], ["厦门日报", "厦门晚报"])
+        self.assertEqual(identify.call_count, 4)
+        self.assertEqual(self.press_ctrl_tab.call_count, 3)
+
+    def test_inventory_does_not_home_when_other_identity_text_is_visible(self) -> None:
+        press_home = Mock()
+        identify = Mock(
+            return_value={
+                "matched": False,
+                "profile_structure_found": True,
+                "header_identity_visible": True,
+                "observed_header_candidates": ["未知公众号"],
+            }
+        )
+        adapter = Win11WeChatAdapter(
+            activate_window=self.activate_window,
+            capture_window=Mock(return_value=Image.new("RGB", (10, 10), "black")),
+            validate_profile_header=self.validate_profile_header,
+            press_ctrl_tab=self.press_ctrl_tab,
+            press_ctrl_w=self.press_ctrl_w,
+            log_event=self.log_event,
+            sleep=Mock(),
+            press_ctrl_home=press_home,
+            identify_profile_account=identify,
+        )
+
+        adapter.inventory_profile_tabs(self.window, ["厦门日报"], max_tabs=1)
+
+        press_home.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

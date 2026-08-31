@@ -1377,8 +1377,8 @@ def close_current_article_tab(
     """正常路径直接关闭当前文章标签，避免每篇文章都轮询全部标签。
 
     文章采集结束时，前台应当仍是刚打开的文章标签。先确认它不是搜一搜
-    页面，再发送一次 Ctrl+W；只有关闭后仍无法确认回到搜一搜时，调用方
-    才会进入全量标签恢复流程。
+    页面，再发送一次 Ctrl+W；关闭后优先在当前标签确认父资料页并保持滚动
+    位置，只有当前返回页无法确认时才进入全量标签恢复流程。
     """
     try:
         article_hwnd, article_rect = find_article_window()
@@ -1420,6 +1420,43 @@ def close_current_article_tab(
         press_ctrl_w()
         time.sleep(0.45)
         if return_window and return_window.page_kind == "embedded_profile_tab":
+            # Ctrl+W 正常会回到打开文章时的父资料页。此时资料页通常仍停留在
+            # 文章卡片所在的滚动位置，账号名称可能不在视口内；不能为了精确
+            # 名称校验调用全标签扫描或 Ctrl+Home，否则会破坏剩余卡片坐标。
+            immediate_evidence: dict[str, Any] = {}
+            for immediate_attempt in range(1, 4):
+                immediate_screenshot = capture_window(return_window.rect)
+                immediate_evidence = PROFILE_OCR.validate_profile_header(
+                    immediate_screenshot, account_name
+                )
+                immediate_structure = bool(
+                    immediate_evidence.get("profile_structure_found")
+                    and not immediate_evidence.get("search_page_evidence")
+                )
+                if immediate_evidence.get("matched") or immediate_structure:
+                    log_event(
+                        "article_tab_closed_directly",
+                        account=account_name,
+                        title=title,
+                        return_page="embedded_profile_tab",
+                        return_validation=(
+                            "exact_account_and_profile_structure"
+                            if immediate_evidence.get("matched")
+                            else "immediate_profile_structure_preserve_scroll"
+                        ),
+                        immediate_attempt=immediate_attempt,
+                        global_profile_scan_skipped=True,
+                    )
+                    return True
+                if immediate_attempt < 3:
+                    time.sleep(0.35)
+            log_event(
+                "article_tab_immediate_return_unconfirmed",
+                account=account_name,
+                title=title,
+                validation=immediate_evidence,
+                action="fallback_to_bounded_profile_scan",
+            )
             if not activate_embedded_profile_tab(return_window, account_name):
                 log_event(
                     "article_tab_direct_close_failed",
@@ -1784,6 +1821,99 @@ def activate_embedded_profile_tab(
         "method": "content-cycle-scan",
     }
     return matched
+
+
+def inventory_existing_profile_pool(
+    browser_window: WindowInfo,
+    accounts: list[str],
+    evidence_root: Path,
+    *,
+    max_tabs: int = WIN11_MAX_TAB_SCAN,
+) -> tuple[dict[str, WindowInfo], dict[str, Any]]:
+    """一次绕圈盘点现有标签，并批量登记全部监听账号资料页。"""
+    global _WATCH_ACTIVE_PROFILE_ACCOUNT
+    evidence_dir = evidence_root / datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    def save_unresolved_evidence(
+        probe_index: int,
+        screenshot: Image.Image,
+        identity: dict[str, Any],
+    ) -> None:
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        path = evidence_dir / f"probe-{probe_index:03d}-unresolved-profile.png"
+        screenshot.save(path)
+        log_event(
+            "watch_profile_inventory_evidence_saved",
+            probe_index=probe_index,
+            path=str(path),
+            observed_header_candidates=identity.get("observed_header_candidates") or [],
+            reason=identity.get("reason"),
+        )
+
+    adapter = Win11WeChatAdapter(
+        activate_window=activate_window,
+        capture_window=capture_window,
+        validate_profile_header=PROFILE_OCR.validate_profile_header,
+        press_ctrl_tab=press_ctrl_tab,
+        press_ctrl_w=press_ctrl_w,
+        log_event=log_event,
+        press_ctrl_home=press_ctrl_home,
+        wait_for_stable_frames=wait_for_stable_frames,
+        inspect_search_page=lambda image: bool(
+            _inspect_sogou_search_results(image).get("found")
+        ),
+        same_search_page=same_sogou_search_workspace,
+        identify_profile_account=PROFILE_OCR.identify_profile_account,
+    )
+    log_event(
+        "watch_profile_inventory_started",
+        accounts=accounts,
+        accounts_total=len(accounts),
+        max_tabs=max_tabs,
+    )
+    result = adapter.inventory_profile_tabs(
+        browser_window,
+        accounts,
+        max_tabs=max_tabs,
+        evidence_callback=save_unresolved_evidence,
+    )
+    profiles = {
+        account: WindowInfo(
+            browser_window.hwnd,
+            browser_window.title,
+            browser_window.class_name,
+            browser_window.rect,
+            browser_window.process_name,
+            "embedded_profile_tab",
+        )
+        for account in result.get("profiles_found") or []
+    }
+
+    positions = result.get("profile_positions") or {}
+    cycle_length = result.get("cycle_length")
+    for source_account, source_position in positions.items():
+        for target_account, target_position in positions.items():
+            if source_account == target_account:
+                continue
+            if cycle_length:
+                steps = (int(target_position) - int(source_position)) % int(cycle_length)
+            else:
+                steps = int(target_position) - int(source_position)
+            if steps > 0:
+                _WATCH_PROFILE_TRANSITIONS[(source_account, target_account)] = steps
+
+    for account, duplicate_positions in (result.get("duplicate_positions") or {}).items():
+        log_event(
+            "watch_profile_inventory_duplicate_observed",
+            account=account,
+            duplicate_positions=duplicate_positions,
+            action="preserve_without_automatic_cleanup",
+        )
+    _WATCH_ACTIVE_PROFILE_ACCOUNT = None
+    for account in accounts:
+        _WATCH_PROFILE_CACHE.pop(account, None)
+    _WATCH_PROFILE_CACHE.update(profiles)
+    return profiles, result
 
 
 def refresh_verified_profile_window(
@@ -2610,12 +2740,50 @@ def load_watch_state(path: Path, account_name: str) -> dict[str, Any]:
         if (normalized := normalize_article_url(str(item)))
     }
     state.update(raw)
+    # 资料页标签登记属于微信 UI 资源状态，不属于文章增量状态。旧版本曾把
+    # profile 复制到每账号 watch-state.json；读取时主动丢弃，避免代码热更新
+    # 后把旧 HWND、旧标签位置误当成可复用资源。
+    state.pop("profile", None)
     state["account"] = account_name
     state["known_urls"] = list(dict.fromkeys(known_urls))
     try:
         state["cycle_count"] = max(0, int(raw.get("cycle_count") or 0))
     except (TypeError, ValueError):
         state["cycle_count"] = 0
+    return state
+
+
+def load_profile_pool_state(
+    path: Path,
+    accounts: list[str],
+    accounts_per_vm: int,
+) -> dict[str, Any]:
+    """加载独立资料页池状态；标签身份必须在当前进程重新 OCR 确认。"""
+    normalized_accounts = list(dict.fromkeys(item.strip() for item in accounts if item.strip()))
+    state: dict[str, Any] = {
+        "version": 1,
+        "accounts": normalized_accounts,
+        "accounts_per_vm": accounts_per_vm,
+        "status": "unverified",
+        "profile_registry": {},
+        "profiles_ready": [],
+        "profiles_unavailable": normalized_accounts,
+        "last_bootstrap_started_at": None,
+        "last_bootstrap_finished_at": None,
+        "last_attach_started_at": None,
+        "last_attach_finished_at": None,
+    }
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return state
+    if not isinstance(raw, dict) or raw.get("accounts") != normalized_accounts:
+        return state
+    state.update(raw)
+    state["version"] = 1
+    state["accounts"] = normalized_accounts
+    state["accounts_per_vm"] = accounts_per_vm
+    state.setdefault("profile_registry", {})
     return state
 
 
@@ -2947,6 +3115,7 @@ def watch_multiple_accounts(
     schedule_start_minutes: int | None = None,
     schedule_end_minutes: int | None = None,
     max_accounts_per_vm: int = 10,
+    profile_pool_mode: str = "bootstrap_and_watch",
 ) -> dict[str, Any]:
     """多账号串行轮询；账号列表只有一项时等价于单账号监听。"""
     global _WATCH_PROFILE_CACHE, _WATCH_ACTIVE_PROFILE_ACCOUNT
@@ -2966,6 +3135,12 @@ def watch_multiple_accounts(
         )
     if (schedule_start_minutes is None) != (schedule_end_minutes is None):
         raise ValueError("监听时间窗口必须同时设置开始时间和结束时间")
+    if profile_pool_mode not in {
+        "bootstrap_and_watch",
+        "bootstrap_only",
+        "existing_only",
+    }:
+        raise ValueError(f"未知资料页池运行模式：{profile_pool_mode}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     multi_account = len(accounts) > 1
@@ -2977,9 +3152,13 @@ def watch_multiple_accounts(
     known_urls: dict[str, set[str]] = {}
     for account in accounts:
         account_dir = account_dirs[account]
-        state = load_watch_state(account_dir / "watch-state.json", account)
+        state = (
+            _default_watch_state(account)
+            if profile_pool_mode == "bootstrap_only"
+            else load_watch_state(account_dir / "watch-state.json", account)
+        )
         urls = set(state.get("known_urls") or [])
-        if write_mongo:
+        if write_mongo and profile_pool_mode != "bootstrap_only":
             try:
                 mongo_urls = load_account_article_urls(
                     mongo_uri or os.getenv("MONGO_URI", "mongodb://192.168.28.70:27019/"),
@@ -2993,41 +3172,55 @@ def watch_multiple_accounts(
                 log_event("watch_known_urls_mongo_load_failed", account=account, error=str(exc))
         state["known_urls"] = list(dict.fromkeys(urls))
         state.setdefault("consecutive_failures", 0)
+        state.pop("profile", None)
         states[account] = state
         known_urls[account] = urls
-        save_watch_state(account_dir / "watch-state.json", state)
+        if profile_pool_mode != "bootstrap_only":
+            save_watch_state(account_dir / "watch-state.json", state)
 
     scheduler_path = output_dir / "scheduler-state.json"
     scheduler_state: dict[str, Any] = {
-        "version": 2,
+        "version": 3,
         "accounts": accounts,
         "accounts_per_vm": max_accounts_per_vm,
-        "phase": "bootstrap_profiles",
-        "profile_registry": {},
+        "phase": "waiting_for_profile_pool",
         "round_count": 0,
         "last_error": None,
     }
-    try:
-        previous = json.loads(scheduler_path.read_text(encoding="utf-8"))
-        if isinstance(previous, dict) and previous.get("accounts") == accounts:
-            scheduler_state.update(previous)
-    except (FileNotFoundError, OSError, ValueError, TypeError):
-        pass
-    # 旧版调度状态只记录轮数，没有资料页预热注册表；每次进程启动都必须重新
-    # 按页面内容建立资料页映射，不能复用旧 HWND、标签序号或旧的阶段状态。
-    scheduler_state["version"] = 2
-    scheduler_state["phase"] = "bootstrap_profiles"
-    scheduler_state.setdefault("profile_registry", {})
-    reuse_existing_profile_tabs = bool(scheduler_state.get("profile_registry"))
-    save_watch_state(scheduler_path, scheduler_state)
+    if profile_pool_mode != "bootstrap_only":
+        try:
+            previous = json.loads(scheduler_path.read_text(encoding="utf-8"))
+            if isinstance(previous, dict) and previous.get("accounts") == accounts:
+                scheduler_state.update(previous)
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            pass
+    # v2 曾把资料页登记混在调度状态中。v3 调度文件只保存轮询进度；资料页池
+    # 独立保存，进程重启后仍必须通过 OCR 重新附着，不能直接信任旧 HWND。
+    scheduler_state.pop("profile_registry", None)
+    scheduler_state.pop("profiles_ready", None)
+    scheduler_state.pop("profiles_unavailable", None)
+    scheduler_state["version"] = 3
+    scheduler_state["phase"] = "waiting_for_profile_pool"
+    if profile_pool_mode != "bootstrap_only":
+        save_watch_state(scheduler_path, scheduler_state)
+    profile_pool_path = output_dir / "profile-pool-state.json"
+    profile_pool_state = load_profile_pool_state(
+        profile_pool_path, accounts, max_accounts_per_vm
+    )
+    reuse_existing_profile_tabs = bool(profile_pool_state.get("profile_registry"))
+    save_watch_state(profile_pool_path, profile_pool_state)
     log_event(
-        "watch_scheduler_started",
+        "watch_profile_pool_process_started"
+        if profile_pool_mode == "bootstrap_only"
+        else "watch_scheduler_started",
         accounts=accounts,
         accounts_total=len(accounts),
         accounts_per_vm=max_accounts_per_vm,
         poll_interval_seconds=poll_interval_seconds,
         recent_card_limit=recent_card_limit,
         state_path=str(scheduler_path),
+        profile_pool_state_path=str(profile_pool_path),
+        profile_pool_mode=profile_pool_mode,
     )
 
     # 保持账号文件中的顺序。多个账号在 Windows 上可能获得完全相同的到期
@@ -3036,28 +3229,61 @@ def watch_multiple_accounts(
     account_order = {account: index for index, account in enumerate(accounts)}
     next_due = {account: datetime.now(timezone.utc) for account in accounts}
     completed_rounds = 0
+    initial_round_count = max(0, int(scheduler_state.get("round_count") or 0))
     waiting_for_start: str | None = None
     active_window_key: str | None = None
     profiles_bootstrapped = False
 
-    def bootstrap_profiles(reason: str) -> None:
+    def bootstrap_profiles(reason: str, *, existing_only: bool = False) -> None:
         """启动监听前逐个建立并验证资料页缓存。
 
         资料页预热与文章采集分离：这里不打开文章，只把搜一搜窗口和已确认的
-        公众号资料页标签注册到内存缓存。某个账号失败时保留其他账号的资料页，
-        后续仅在该账号轮到时执行局部搜索恢复。
+        公众号资料页标签注册到内存缓存。独立预热模式允许搜索建池；热更新附着
+        模式只扫描现有标签，某个账号失败时保留其他账号且禁止自动搜索重建。
         """
         nonlocal profiles_bootstrapped
-        scheduler_state["phase"] = "bootstrap_profiles"
-        scheduler_state["bootstrap_started_at"] = datetime.now(timezone.utc).isoformat()
-        scheduler_state["bootstrap_reason"] = reason
-        save_watch_state(scheduler_path, scheduler_state)
+        phase = "attach_existing_profile_pool" if existing_only else "bootstrap_profiles"
+        scheduler_state["phase"] = phase
+        timestamp_key = "last_attach_started_at" if existing_only else "last_bootstrap_started_at"
+        profile_pool_state[timestamp_key] = datetime.now(timezone.utc).isoformat()
+        profile_pool_state["status"] = "attaching" if existing_only else "bootstrapping"
+        profile_pool_state["reason"] = reason
+        if profile_pool_mode != "bootstrap_only":
+            save_watch_state(scheduler_path, scheduler_state)
+        save_watch_state(profile_pool_path, profile_pool_state)
         log_event(
-            "watch_profile_bootstrap_started",
+            "watch_profile_pool_attach_started" if existing_only else "watch_profile_bootstrap_started",
             accounts=accounts,
             accounts_total=len(accounts),
             reason=reason,
         )
+
+        attached_profiles: dict[str, WindowInfo] = {}
+        if existing_only:
+            try:
+                browser_window = (
+                    next(iter(_WATCH_PROFILE_CACHE.values()))
+                    if _WATCH_PROFILE_CACHE
+                    else find_sogou_search_window()
+                )
+                browser_window = arrange_automation_window(browser_window, "profile")
+                attached_profiles, inventory_result = inventory_existing_profile_pool(
+                    browser_window,
+                    accounts,
+                    output_dir / "profile-pool-inventory",
+                )
+                log_event(
+                    "watch_profile_pool_inventory_applied",
+                    profiles_found=inventory_result.get("profiles_found") or [],
+                    profiles_missing=inventory_result.get("profiles_missing") or [],
+                    completed_cycle=bool(inventory_result.get("completed_cycle")),
+                )
+            except Exception as inventory_exc:
+                log_event(
+                    "watch_profile_pool_inventory_failed",
+                    error=str(inventory_exc),
+                    action="mark_accounts_temporarily_unverified_without_search",
+                )
 
         for account in accounts:
             account_dir = account_dirs[account]
@@ -3065,7 +3291,8 @@ def watch_multiple_accounts(
             bootstrap_error = ""
             profile_window: WindowInfo | None = None
             observed_name = account
-            for attempt in range(1, 4):
+            max_attempts = 1 if existing_only else 3
+            for attempt in range(1, max_attempts + 1):
                 try:
                     log_event(
                         "watch_profile_bootstrap_attempt",
@@ -3073,7 +3300,17 @@ def watch_multiple_accounts(
                         attempt=attempt,
                         output_dir=str(bootstrap_dir / f"attempt-{attempt}"),
                     )
-                    if attempt == 1 and reuse_existing_profile_tabs:
+                    if attempt == 1 and existing_only:
+                        profile_window = attached_profiles.get(account)
+                        if profile_window is not None:
+                            observed_name = account
+                            log_event(
+                                "watch_profile_bootstrap_existing_tab_reused",
+                                account=account,
+                                hwnd=profile_window.hwnd,
+                                method="single-pass-profile-pool-inventory",
+                            )
+                    elif attempt == 1 and reuse_existing_profile_tabs:
                         try:
                             if _WATCH_PROFILE_CACHE:
                                 browser_window = next(iter(_WATCH_PROFILE_CACHE.values()))
@@ -3108,6 +3345,10 @@ def watch_multiple_accounts(
                                 error=str(reuse_exc),
                                 action="continue_with_search",
                             )
+                    if profile_window is None and existing_only:
+                        raise ProfileTemporarilyUnverifiedError(
+                            "现有资料页池中未确认目标账号；热更新附着模式禁止自动搜索重建"
+                        )
                     if profile_window is None:
                         profile_window, observed_name = search_and_open_profile(
                             account,
@@ -3117,16 +3358,18 @@ def watch_multiple_accounts(
                             manual_fallback_seconds=manual_search_fallback_seconds,
                         )
                     _WATCH_PROFILE_CACHE[account] = profile_window
-                    if profile_window.page_kind == "embedded_profile_tab" and reuse_existing_profile_tabs:
-                        # 旧监听状态存在时可能已经积累同账号重复页。每次只安全
-                        # 关闭一个重复页并从搜一搜重新起步，避免关闭后相邻标签
-                        # 选择不确定而误伤主标签或其他账号。
-                        for _dedup_round in range(8):
-                            dedup_result = deduplicate_account_profile_tabs(
-                                profile_window, account
-                            )
-                            if not dedup_result.get("duplicates_closed"):
-                                break
+                    if existing_only:
+                        # 热更新附着只负责把已经精确确认的资料页重新登记到内存。
+                        # 不在这里寻找搜一搜或扫描全标签去重，否则每成功附着一个
+                        # 账号都会再次绕行整个标签池，并把“当前不是搜一搜”记录成
+                        # 容易误解的 found=false。重复页只允许在已经获得同账号重复
+                        # 证据后，通过账号级定向维护流程处理。
+                        log_event(
+                            "watch_profile_attach_registered_without_dedup",
+                            account=account,
+                            hwnd=profile_window.hwnd,
+                            reason="hot_attach_only_registers_exact_profile_match",
+                        )
                     registry_item = {
                         "status": "ready",
                         "account": account,
@@ -3136,13 +3379,13 @@ def watch_multiple_accounts(
                         "verified_at": datetime.now(timezone.utc).isoformat(),
                         "bootstrap_attempt": attempt,
                     }
-                    scheduler_state.setdefault("profile_registry", {})[account] = registry_item
-                    states[account]["profile"] = registry_item
+                    profile_pool_state.setdefault("profile_registry", {})[account] = registry_item
                     states[account]["last_error"] = None
-                    save_watch_state(account_dir / "watch-state.json", states[account])
-                    save_watch_state(scheduler_path, scheduler_state)
+                    if profile_pool_mode != "bootstrap_only":
+                        save_watch_state(account_dir / "watch-state.json", states[account])
+                    save_watch_state(profile_pool_path, profile_pool_state)
                     log_event(
-                        "watch_profile_bootstrap_succeeded",
+                        "watch_profile_pool_attach_succeeded" if existing_only else "watch_profile_bootstrap_succeeded",
                         account=account,
                         observed_name=observed_name,
                         page_kind=profile_window.page_kind,
@@ -3167,42 +3410,63 @@ def watch_multiple_accounts(
                     "verified_at": None,
                     "last_error": bootstrap_error,
                 }
-                scheduler_state.setdefault("profile_registry", {})[account] = registry_item
-                states[account]["profile"] = registry_item
+                profile_pool_state.setdefault("profile_registry", {})[account] = registry_item
                 states[account]["last_error"] = bootstrap_error
                 states[account]["consecutive_failures"] = int(
                     states[account].get("consecutive_failures") or 0
                 ) + 1
-                save_watch_state(account_dir / "watch-state.json", states[account])
-                save_watch_state(scheduler_path, scheduler_state)
+                if profile_pool_mode != "bootstrap_only":
+                    save_watch_state(account_dir / "watch-state.json", states[account])
+                save_watch_state(profile_pool_path, profile_pool_state)
                 log_event(
-                    "watch_profile_bootstrap_failed",
+                    "watch_profile_pool_attach_failed" if existing_only else "watch_profile_bootstrap_failed",
                     account=account,
                     error=bootstrap_error,
                     category=classify_collection_error(RuntimeError(bootstrap_error)),
                     action="defer_without_declaring_profile_absent",
                 )
 
-        scheduler_state["phase"] = "poll_profiles"
-        scheduler_state["bootstrap_finished_at"] = datetime.now(timezone.utc).isoformat()
-        scheduler_state["profiles_ready"] = [
+        scheduler_state["phase"] = "profile_pool_ready"
+        finished_key = "last_attach_finished_at" if existing_only else "last_bootstrap_finished_at"
+        profile_pool_state[finished_key] = datetime.now(timezone.utc).isoformat()
+        profile_pool_state["profiles_ready"] = [
             account
             for account in accounts
             if account in _WATCH_PROFILE_CACHE
         ]
-        scheduler_state["profiles_unavailable"] = [
+        profile_pool_state["profiles_unavailable"] = [
             account
             for account in accounts
             if account not in _WATCH_PROFILE_CACHE
         ]
-        save_watch_state(scheduler_path, scheduler_state)
+        profile_pool_state["status"] = (
+            "ready" if not profile_pool_state["profiles_unavailable"] else "partially_ready"
+        )
+        if profile_pool_mode != "bootstrap_only":
+            save_watch_state(scheduler_path, scheduler_state)
+        save_watch_state(profile_pool_path, profile_pool_state)
         profiles_bootstrapped = True
         log_event(
-            "watch_profile_bootstrap_finished",
-            profiles_ready=scheduler_state["profiles_ready"],
-            profiles_unavailable=scheduler_state["profiles_unavailable"],
-            action="start_serial_profile_polling",
+            "watch_profile_pool_attach_finished" if existing_only else "watch_profile_bootstrap_finished",
+            profiles_ready=profile_pool_state["profiles_ready"],
+            profiles_unavailable=profile_pool_state["profiles_unavailable"],
+            action=(
+                "exit_after_profile_pool_ready"
+                if profile_pool_mode == "bootstrap_only"
+                else "start_serial_profile_polling"
+            ),
         )
+
+    if profile_pool_mode == "bootstrap_only":
+        bootstrap_profiles("explicit_profile_pool_bootstrap")
+        return {
+            "mode": "bootstrap_profile_pool",
+            "accounts_total": len(accounts),
+            "profiles_ready": profile_pool_state.get("profiles_ready", []),
+            "profiles_unavailable": profile_pool_state.get("profiles_unavailable", []),
+            "state_path": str(profile_pool_path),
+            "last_error": None,
+        }
 
     try:
         while watch_cycles == 0 or completed_rounds < watch_cycles:
@@ -3244,12 +3508,15 @@ def watch_multiple_accounts(
                 bootstrap_profiles(
                     "schedule_window_opened"
                     if schedule_start_minutes is not None
-                    else "listener_start"
+                    else "listener_start",
+                    existing_only=profile_pool_mode == "existing_only",
                 )
+                scheduler_state["phase"] = "poll_profiles"
+                save_watch_state(scheduler_path, scheduler_state)
 
             if not pending:
                 completed_rounds += 1
-                scheduler_state["round_count"] = completed_rounds
+                scheduler_state["round_count"] = initial_round_count + completed_rounds
                 scheduler_state["last_round_finished_at"] = datetime.now(timezone.utc).isoformat()
                 save_watch_state(scheduler_path, scheduler_state)
                 if watch_cycles and completed_rounds >= watch_cycles:
@@ -3290,6 +3557,48 @@ def watch_multiple_accounts(
 
             cached_profile = _WATCH_PROFILE_CACHE.get(account)
             try:
+                if cached_profile is None and profile_pool_mode == "existing_only":
+                    try:
+                        browser_window = (
+                            next(iter(_WATCH_PROFILE_CACHE.values()))
+                            if _WATCH_PROFILE_CACHE
+                            else find_sogou_search_window()
+                        )
+                        if activate_embedded_profile_tab(
+                            browser_window,
+                            account,
+                            max_tabs=WIN11_MAX_TAB_SCAN,
+                        ):
+                            cached_profile = arrange_automation_window(
+                                WindowInfo(
+                                    browser_window.hwnd,
+                                    browser_window.title,
+                                    browser_window.class_name,
+                                    browser_window.rect,
+                                    browser_window.process_name,
+                                    "embedded_profile_tab",
+                                ),
+                                "profile",
+                            )
+                            _WATCH_PROFILE_CACHE[account] = cached_profile
+                            log_event(
+                                "watch_profile_pool_reattached",
+                                account=account,
+                                cycle=cycle_number,
+                                hwnd=cached_profile.hwnd,
+                            )
+                    except Exception as attach_exc:
+                        log_event(
+                            "watch_profile_pool_reattach_failed",
+                            account=account,
+                            cycle=cycle_number,
+                            error=str(attach_exc),
+                            action="skip_without_search_rebuild",
+                        )
+                    if cached_profile is None:
+                        raise ProfileTemporarilyUnverifiedError(
+                            "热更新采集模式未附着到现有资料页，本轮跳过且不自动搜索重建"
+                        )
                 summary = collect_profile_account(
                     client,
                     account,
@@ -3328,7 +3637,7 @@ def watch_multiple_accounts(
                 state["consecutive_failures"] = 0
                 cached_profile = _WATCH_PROFILE_CACHE.get(account)
                 if cached_profile is not None:
-                    registry_item = scheduler_state.setdefault("profile_registry", {}).get(account, {})
+                    registry_item = profile_pool_state.setdefault("profile_registry", {}).get(account, {})
                     registry_item.update(
                         {
                             "status": "ready",
@@ -3338,8 +3647,7 @@ def watch_multiple_accounts(
                             "last_ready_at": datetime.now(timezone.utc).isoformat(),
                         }
                     )
-                    scheduler_state["profile_registry"][account] = registry_item
-                    state["profile"] = registry_item
+                    profile_pool_state["profile_registry"][account] = registry_item
                 log_event(
                     "watch_account_cycle_finished",
                     account=account,
@@ -3356,7 +3664,7 @@ def watch_multiple_accounts(
                 temporary = isinstance(exc, ProfileTemporarilyUnverifiedError) or not completed_cycle
                 if not temporary:
                     _WATCH_PROFILE_CACHE.pop(account, None)
-                registry_item = scheduler_state.setdefault("profile_registry", {}).get(account, {})
+                registry_item = profile_pool_state.setdefault("profile_registry", {}).get(account, {})
                 registry_item.update(
                     {
                         "status": (
@@ -3367,7 +3675,7 @@ def watch_multiple_accounts(
                         "last_scan_state": scan_state,
                     }
                 )
-                scheduler_state["profile_registry"][account] = registry_item
+                profile_pool_state["profile_registry"][account] = registry_item
                 state["last_error"] = str(exc)
                 state["consecutive_failures"] = int(state.get("consecutive_failures") or 0) + 1
                 log_event(
@@ -3385,19 +3693,24 @@ def watch_multiple_accounts(
                 )
             state["last_cycle_finished_at"] = datetime.now(timezone.utc).isoformat()
             save_watch_state(account_dir / "watch-state.json", state)
-            scheduler_state["profiles_ready"] = [
+            profile_pool_state["profiles_ready"] = [
                 item for item in accounts if item in _WATCH_PROFILE_CACHE
             ]
-            scheduler_state["profiles_unavailable"] = [
+            profile_pool_state["profiles_unavailable"] = [
                 item for item in accounts if item not in _WATCH_PROFILE_CACHE
             ]
+            profile_pool_state["status"] = (
+                "ready" if not profile_pool_state["profiles_unavailable"] else "partially_ready"
+            )
             save_watch_state(scheduler_path, scheduler_state)
+            save_watch_state(profile_pool_path, profile_pool_state)
             pending.remove(account)
             next_due[account] = datetime.now(timezone.utc) + timedelta(seconds=poll_interval_seconds)
     except KeyboardInterrupt:
         log_event("watch_scheduler_stopped", accounts=accounts, reason="keyboard_interrupt")
     finally:
         save_watch_state(scheduler_path, scheduler_state)
+        save_watch_state(profile_pool_path, profile_pool_state)
 
     account_results = []
     total_known_urls = 0
@@ -3420,9 +3733,10 @@ def watch_multiple_accounts(
         "mode": "watch",
         "accounts": account_results,
         "accounts_total": len(accounts),
-        "rounds": scheduler_state.get("round_count", completed_rounds),
+        "rounds": scheduler_state.get("round_count", initial_round_count + completed_rounds),
         "known_urls": total_known_urls,
         "state_path": str(scheduler_path),
+        "profile_pool_state_path": str(profile_pool_path),
         "last_error": last_error,
     }
 
@@ -6114,6 +6428,17 @@ def parse_args() -> argparse.Namespace:
         "--watch-accounts-file",
         help="常驻增量监听账号文件，每行一个公众号名称，支持 # 注释",
     )
+    profile_pool_group = parser.add_mutually_exclusive_group()
+    profile_pool_group.add_argument(
+        "--bootstrap-profile-pool",
+        action="store_true",
+        help="只建立并验证资料页池，不采集文章；完成后保留微信标签并退出",
+    )
+    profile_pool_group.add_argument(
+        "--watch-existing-profile-pool",
+        action="store_true",
+        help="热更新采集：只附着现有资料页池，不在启动阶段重新搜索账号",
+    )
     parser.add_argument(
         "--accounts-per-vm",
         type=int,
@@ -6253,7 +6578,12 @@ def main() -> None:
             client = QwenVisionClient(QwenVisionConfig(base_url="", api_key=""))
             vl_available = False
             log_event("qwen_vl_unavailable", reason=str(exc))
-    if args.watch_account or args.watch_accounts_file:
+    if (
+        args.watch_account
+        or args.watch_accounts_file
+        or args.bootstrap_profile_pool
+        or args.watch_existing_profile_pool
+    ):
         if not args.live:
             raise RuntimeError("增量监听模式必须显式传入 --live")
         if args.run_search_accounts or args.run_one_account or args.collect_open_article:
@@ -6285,7 +6615,11 @@ def main() -> None:
             log_event(
                 "watch_persistence_local_only",
                 accounts=watch_account_names,
-                reason="未传入 --write-mongo，跨重启状态只依赖 watch-state.json",
+                reason=(
+                    "资料页预热仅写 profile-pool-state.json"
+                    if args.bootstrap_profile_pool
+                    else "未传入 --write-mongo，跨重启文章去重依赖 watch-state.json"
+                ),
             )
         result = watch_multiple_accounts(
             client,
@@ -6316,15 +6650,28 @@ def main() -> None:
             schedule_start_minutes=args.watch_start_time,
             schedule_end_minutes=args.watch_end_time,
             max_accounts_per_vm=args.accounts_per_vm,
+            profile_pool_mode=(
+                "bootstrap_only"
+                if args.bootstrap_profile_pool
+                else (
+                    "existing_only"
+                    if args.watch_existing_profile_pool
+                    else "bootstrap_and_watch"
+                )
+            ),
         )
         log_event(
             "run_finished",
-            mode="watch",
+            mode=result.get("mode", "watch"),
             accounts_total=result.get("accounts_total"),
-            accounts_failed=sum(
-                1
-                for item in result.get("accounts", [])
-                if item.get("last_error")
+            accounts_failed=(
+                len(result.get("profiles_unavailable", []))
+                if result.get("mode") == "bootstrap_profile_pool"
+                else sum(
+                    1
+                    for item in result.get("accounts", [])
+                    if item.get("last_error")
+                )
             ),
             rounds=result.get("rounds"),
             known_urls=result.get("known_urls"),
